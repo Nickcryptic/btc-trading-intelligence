@@ -10,8 +10,8 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.3.0</i></small></div></div>
-  <div class="top-right"><span class="live-badge" id="connection" role="status">● CONNECTING</span><span class="refresh-label">2 MIN AUTO REFRESH</span><button id="reload" class="icon-button" aria-label="Refresh market data">↻</button></div>
+  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.4.0</i></small></div></div>
+  <div class="top-right"><span class="live-badge" id="connection" role="status">● CONNECTING</span><div class="refresh-detail"><span class="refresh-label">2 MIN AUTO REFRESH</span><small id="updated-mini">Updated: awaiting feed</small></div><button id="reload" class="icon-button" aria-label="Refresh market data">↻</button></div>
 </header>
 <main>
   <section class="intro">
@@ -67,6 +67,11 @@
       <div><label>TAKE PROFIT 03</label><strong id="tp3">—</strong></div>
     </div>
     <div class="plan-bottom"><span class="plan-icon">◎</span><span id="plan-reason">No levels until a research confluence is present.</span><span class="plan-mode">SIMULATION / NOT EXECUTABLE</span></div>
+    <div class="trade-log-wrap">
+      <div class="trade-log-title"><div><span class="eyebrow">TEST SIGNAL JOURNAL</span><h3>Latest 5 signal entries <span id="signal-log-symbol">BTC</span></h3></div><span class="badge">UTC · OBSERVED PRICES</span></div>
+      <p class="muted-detail">A new entry appears when a candidate changes, or every 30 minutes while it persists. Outcomes reflect sampled spot prices—not verified fills or backtested profit.</p>
+      <div class="trade-log-scroll"><table class="trade-log-table"><thead><tr><th>Issued (UTC)</th><th>Side</th><th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>Stop</th><th>Observed result</th></tr></thead><tbody id="signal-log"><tr><td colspan="8">Waiting for first test signal…</td></tr></tbody></table></div>
+    </div>
   </section>
 
   <section class="section-heading indicator-title"><div><p class="eyebrow">03 / THE EVIDENCE</p><h2>Individual indicator intelligence</h2><p>Every live indicator has a directional reading, source and relevant timeframe. Neutral does not mean missing.</p></div><span class="badge green">LIVE READINGS</span></section>
@@ -82,25 +87,41 @@
       <p class="muted-detail">Reference levels from recent completed hourly candles. They are not guaranteed to hold.</p>
     </article>
     <article class="context-card">
-      <div class="section-heading compact"><div><p class="eyebrow">05 / FAIR VALUE GAPS</p><h2>Open imbalance zones</h2></div><span class="badge">15M</span></div>
+      <div class="section-heading compact"><div><p class="eyebrow">05 / FAIR VALUE GAPS</p><h2>Open imbalance zones</h2></div><div class="tf-switch" role="group" aria-label="Select FVG timeframe"><button class="active" data-fvg-tf="15m" aria-pressed="true">15M</button><button data-fvg-tf="1h" aria-pressed="false">1H</button><button data-fvg-tf="1d" aria-pressed="false">1D</button></div></div>
       <div id="fvg" class="zone-list"><p class="placeholder">Checking gaps…</p></div>
+      <p class="muted-detail" id="fvg-note">Uses completed exchange spot candles; timeframe selection changes the view, not the underlying signal score.</p>
+      <details class="cme-note"><summary>CME futures gaps · data status <span>＋</span></summary><p>Exchange spot FVGs are not CME futures gaps. CME futures open/close data is not connected to this free version, so no CME gap prices are invented. <a href="https://www.cmegroup.com/markets/cryptocurrencies/bitcoin/bitcoin.html" target="_blank" rel="noopener noreferrer">CME reference ↗</a></p></details>
+    </article>
+  </section>
+
+  <section class="microstructure-grid" aria-label="Exchange order book and spot liquidity clusters">
+    <article class="context-card depth-card">
+      <div class="section-heading compact"><div><p class="eyebrow">06 / SPOT ORDER BOOK</p><h2>Depth & spread</h2><p id="book-source">Waiting for exchange depth…</p></div><span class="badge green">LIVE SNAPSHOT</span></div>
+      <div id="depth-summary" class="depth-summary"><p class="placeholder">Waiting for order book data…</p></div>
+      <div class="ladder-grid"><div><h3>BID LADDER <small>buyers</small></h3><div id="bid-ladder" class="ladder-list"></div></div><div><h3>ASK LADDER <small>sellers</small></h3><div id="ask-ladder" class="ladder-list"></div></div></div>
+      <p class="muted-detail">Displayed depth covers up to 100 resting spot price levels on each side. Orders can be cancelled without trading.</p>
+    </article>
+    <article class="context-card cluster-card">
+      <div class="section-heading compact"><div><p class="eyebrow">07 / LIQUIDITY CLUSTERS</p><h2>Where limit orders sit</h2><p>Highest-value spot order bands near market price</p></div><span class="badge">5 BP BANDS</span></div>
+      <div id="cluster-list" class="cluster-list"><p class="placeholder">Calculating resting-order clusters…</p></div>
+      <p class="muted-detail">These clusters are visible exchange limit orders, <b>not forced-liquidation levels</b>. Futures liquidation maps require a separate verified feed.</p>
     </article>
   </section>
 
   <section class="history-grid">
     <article class="lower-card">
-      <div class="section-heading compact"><div><p class="eyebrow">06 / OBSERVATIONS</p><h2>Last 10 research snapshots</h2><p>Five-minute decisions while the server is active.</p></div><span class="badge">PAPER LOG</span></div>
+      <div class="section-heading compact"><div><p class="eyebrow">08 / OBSERVATIONS</p><h2>Last 10 research snapshots</h2><p>Five-minute decisions while the server is active.</p></div><span class="badge">PAPER LOG</span></div>
       <div id="decision-history" class="history-list"><p class="placeholder">Waiting for first observation…</p></div>
     </article>
     <article class="lower-card">
-      <div class="section-heading compact"><div><p class="eyebrow">07 / MODEL COVERAGE</p><h2>23-parameter roadmap</h2><p>Available sources are separated from integrations we have not verified.</p></div><span class="badge amber" id="coverage-summary">PARTIAL</span></div>
+      <div class="section-heading compact"><div><p class="eyebrow">09 / MODEL COVERAGE</p><h2>23-parameter roadmap</h2><p>Available sources are separated from integrations we have not verified.</p></div><span class="badge amber" id="coverage-summary">PARTIAL</span></div>
       <p class="coverage-intro">The missing data is <b>excluded from scores</b>. It isn't silently treated as a BUY or SELL.</p>
       <details id="coverage-details"><summary>View all 23 parameters and connection status <span>＋</span></summary><div id="coverage" class="coverage-list"></div></details>
       <details><summary>Wintermute monitoring-only observations <span>＋</span></summary><div id="wintermute-history" class="history-list muted-detail">Awaiting observations.</div></details>
     </article>
   </section>
 
-  <footer><div><strong>BTC INTELLIGENCE <span>v0.3.0</span></strong><p>Research software • no brokerage connection • no live trading or Telegram alerts.</p></div><div>Free Render hosting may sleep when inactive. Readings can become stale. <b>Not financial advice.</b></div></footer>
+  <footer><div><strong>BTC INTELLIGENCE <span>v0.4.0</span></strong><p>Research software • no brokerage connection • no live trading or Telegram alerts.</p></div><div>Free Render hosting may sleep when inactive. Signal history on the free server can reset after redeployment. <b>Not financial advice.</b></div></footer>
 </main>
 <script src="/static/app.js"></script>
 </body>
