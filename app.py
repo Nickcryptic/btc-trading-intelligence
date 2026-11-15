@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -21,7 +22,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'version': '0.3.0'}
+STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'version': '0.4.0'}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
 
@@ -87,6 +88,90 @@ def fvg_zones(candles, limit=8):
         filled = any(c['low']<=low if kind=='bullish' else c['high']>=high for c in later)
         zones.append({'kind':kind,'low':round(low,2),'high':round(high,2),'status':'filled' if filled else 'open','at':third['ts']})
     return zones[-limit:][::-1]
+
+
+def order_book_snapshot(book, price):
+    """Public spot L2 resting orders; NOT leveraged position liquidation levels."""
+    def parse_side(side, reverse):
+        rows=[]
+        for row in book.get(side, [])[:100]:
+            try:
+                level, qty=float(row[0]),float(row[1])
+                if math.isfinite(level) and math.isfinite(qty) and level>0 and qty>0:
+                    rows.append((level,qty))
+            except (TypeError,ValueError,IndexError):
+                continue
+        return sorted(rows,reverse=reverse)
+    bids,asks=parse_side('bids',True),parse_side('asks',False)
+    if not bids or not asks:
+        return None
+    bid_usd=sum(p*q for p,q in bids)
+    ask_usd=sum(p*q for p,q in asks)
+    total=bid_usd+ask_usd
+    step=max(price*0.0005,0.01)  # 5-bp price bands, not liquidation estimates
+    clusters=[]
+    for side,rows in (('BID',bids),('ASK',asks)):
+        bands={}
+        for p,q in rows:
+            bucket=math.floor(p/step)
+            bands[bucket]=bands.get(bucket,0)+p*q
+        for bucket,amount in bands.items():
+            level=round((bucket+0.5)*step,2)
+            clusters.append({'side':side,'price':level,'usd':round(amount,2),
+                             'distance_pct':round((level/price-1)*100,3)})
+    clusters=sorted(clusters,key=lambda x:x['usd'],reverse=True)[:8]
+    def ladder(rows):
+        return [{'price':round(p,2),'quantity':round(q,6),'usd':round(p*q,2)} for p,q in rows[:7]]
+    return {'source':'Spot L2 order book · top 100 levels per side',
+            'best_bid':round(bids[0][0],2),'best_ask':round(asks[0][0],2),
+            'bid_usd':round(bid_usd,2),'ask_usd':round(ask_usd,2),
+            'bid_share':round(bid_usd/total*100,1) if total else None,
+            'bids':ladder(bids),'asks':ladder(asks),'clusters':clusters,
+            'band_width':round(step,2)}
+
+
+def observed_signal_status(row, price):
+    """Update only from observed poll prices; never claim that a limit order filled."""
+    old=row['status']
+    if old in ('SL SEEN','SL AFTER TP1','SL AFTER TP2','TP3 SEEN'):
+        return old
+    long=row['side']=='LONG'
+    stop_hit=price<=row['stop'] if long else price>=row['stop']
+    if stop_hit:
+        return ('SL AFTER TP2' if old=='TP2 SEEN' else
+                'SL AFTER TP1' if old=='TP1 SEEN' else 'SL SEEN')
+    for target in (3,2,1):
+        reached=price>=row[f'tp{target}'] if long else price<=row[f'tp{target}']
+        if reached:
+            if old in ('TP1 SEEN','TP2 SEEN') and int(old[2])>=target:
+                return old
+            return f'TP{target} SEEN'
+    return old
+
+
+def record_signal_log(symbol, asset, previous_direction):
+    """Store distinct/test candidate observations, no more than once per 30m for unchanged bias."""
+    now=datetime.now(timezone.utc)
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory=sqlite3.Row
+        existing=list(db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 50',(symbol,)))
+        for row in existing:
+            next_status=observed_signal_status(row,asset['price'])
+            if next_status!=row['status']:
+                db.execute('UPDATE signals SET status=? WHERE id=?',(next_status,row['id']))
+        direction=asset['direction']
+        levels=asset['levels']
+        if levels and direction in ('LONG CANDIDATE','SHORT CANDIDATE'):
+            last=existing[0] if existing else None
+            elapsed=(now-datetime.fromisoformat(last['ts'])).total_seconds() if last else float('inf')
+            side='LONG' if direction.startswith('LONG') else 'SHORT'
+            newly_issued=previous_direction!=direction
+            if not last or (newly_issued and (last['side']!=side or elapsed>=120)) or elapsed>=1800:
+                db.execute('INSERT INTO signals(ts,symbol,side,entry,stop,tp1,tp2,tp3,bias,timing,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                           (now.isoformat(),symbol,side,levels['entry'],levels['stop'],
+                            levels['tp1'],levels['tp2'],levels['tp3'],asset['bias'],asset['timing'],'TRACKING'))
+        db.execute('DELETE FROM signals WHERE id NOT IN (SELECT id FROM signals ORDER BY id DESC LIMIT 100)')
+        return [dict(row) for row in db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5',(symbol,))]
 
 
 def score_label(score):
@@ -223,7 +308,12 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
         entry=price; stop=entry-side*max(1.5*a,price*.003)
         risk=abs(entry-stop)
         levels={'entry':round(entry,2),'stop':round(stop,2),'tp1':round(entry+side*risk,2),'tp2':round(entry+side*2*risk,2),'tp3':round(entry+side*3*risk,2),'status':'ILLUSTRATIVE / NOT CONFIRMED'}
-    zones=fvg_zones(k15[:-1])
+    zones_by_timeframe={
+        '15m':fvg_zones(k15[:-1],12),
+        '1h':fvg_zones(k1h[:-1],12),
+        '1d':fvg_zones(kd[:-1],12),
+    }
+    zones=zones_by_timeframe['15m']
     nearby=[z for z in zones if z['status']=='open' and abs(price-(z['low']+z['high'])/2)/price<0.015]
     closest=min(nearby,key=lambda z:abs(price-(z['low']+z['high'])/2)) if nearby else None
     fvg_signal=('BUY' if closest['kind']=='bullish' else 'SELL') if closest else 'NEUTRAL'
@@ -254,7 +344,7 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
     if halving:
         indicators.append({'name':'Bitcoin Halving Cycle','value':f'{halving["blocks_remaining"]:,} blocks left',
                            'signal':'NEUTRAL','source':halving['source']+' · context only'})
-    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'indicators':indicators,'fvg':zones,'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Test confluence evaluated live; production-grade signal confirmation is pending validation'}
+    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'indicators':indicators,'fvg':zones,'fvg_by_timeframe':zones_by_timeframe,'order_book':order_book_snapshot(book,price),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Test confluence evaluated live; production-grade signal confirmation is pending validation'}
 
 
 def parse_klines(rows):
@@ -338,7 +428,7 @@ async def fetch_asset(client,symbol,macro=None):
 
 
 async def refresh():
-    async with httpx.AsyncClient(headers={'User-Agent':'BTC-Intelligence/0.3'}) as client:
+    async with httpx.AsyncClient(headers={'User-Agent':'BTC-Intelligence/0.4'}) as client:
         macro=await fetch_macro(client)
         results=await asyncio.gather(*(fetch_asset(client,s,macro) for s in SYMBOLS),return_exceptions=True)
     async with LOCK:
@@ -347,8 +437,11 @@ async def refresh():
                 STATE['source_errors'][symbol]=str(result)[:180]
                 LOG.warning('%s refresh failed: %s',symbol,result)
             else:
+                previous=STATE['previous_direction'].get(symbol)
                 STATE['assets'][symbol]=result
                 STATE['source_errors'].pop(symbol,None)
+                STATE['signal_log'][symbol]=record_signal_log(symbol,result,previous)
+                STATE['previous_direction'][symbol]=result['direction']
                 history=STATE['decision_log'].setdefault(symbol,[])
                 ts=datetime.now(timezone.utc)
                 if not history or (ts-datetime.fromisoformat(history[0]['ts'])).total_seconds()>=300:
@@ -390,7 +483,7 @@ async def lifespan(app):
     try: await wintermute_task
     except asyncio.CancelledError: pass
 
-app=FastAPI(title='BTC Intelligence',version='0.3.0',lifespan=lifespan)
+app=FastAPI(title='BTC Intelligence',version='0.4.0',lifespan=lifespan)
 
 
 @app.middleware('http')
