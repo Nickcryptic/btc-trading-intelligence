@@ -21,8 +21,9 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STATE = {'updated': None, 'assets': {}, 'fear_greed': None, 'source_errors': {}, 'wintermute': [], 'version': '0.2.2'}
+STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'version': '0.3.0'}
 LOCK = asyncio.Lock()
+MACRO_CACHE = {'expires': 0, 'value': {}}
 
 
 def init_db():
@@ -95,7 +96,85 @@ def score_label(score):
     return 'NEUTRAL'
 
 
-def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spot_source='Binance spot', market_pair=None):
+def parse_stablecoin_growth(rows):
+    """DefiLlama's aggregate USD-pegged circulating supply, compared 30 days apart."""
+    points = []
+    for row in rows:
+        if not isinstance(row,dict):
+            continue
+        usd = row.get('totalCirculatingUSD') or row.get('totalCirculating') or {}
+        value = usd.get('peggedUSD') if isinstance(usd, dict) else None
+        try:
+            if value is not None and float(value) > 0:
+                points.append((int(row['date']), float(value)))
+        except (TypeError, ValueError, KeyError):
+            continue
+    points.sort()
+    if not points:
+        return None
+    last_ts, last_value = points[-1]
+    target = last_ts - 30*86400
+    earlier = [value for ts,value in points if ts <= target]
+    if not earlier:
+        return None
+    change = (last_value / earlier[-1] - 1)*100
+    return {'value':round(last_value,2),'change30d':round(change,2), 'timestamp':last_ts,
+            'signal':score_label(change*60),'source':'DefiLlama · stablecoin supply'}
+
+
+def halving_context(height):
+    next_height=(height//210000+1)*210000
+    remaining=next_height-height
+    return {'height':height,'next_height':next_height,'blocks_remaining':remaining,
+            'estimated_days':round(remaining/144,0),'signal':'NEUTRAL','source':'mempool.space · block height'}
+
+
+async def fetch_macro(client):
+    """Macro series are slow: refresh periodically, not on every 2-minute tick."""
+    if time.monotonic() < MACRO_CACHE['expires']:
+        return MACRO_CACHE['value']
+    async def stablecoins():
+        errors=[]
+        for base in ('https://api.llama.fi','https://stablecoins.llama.fi'):
+            try:
+                series=await fetch_json(client,base+'/stablecoincharts/all')
+                parsed=parse_stablecoin_growth(series)
+                if parsed:
+                    return parsed
+                errors.append('Missing comparable 30-day observations')
+            except Exception as exc:
+                errors.append(str(exc)[:80])
+        raise RuntimeError('; '.join(errors))
+    async def halving():
+        response=await client.get('https://mempool.space/api/blocks/tip/height',timeout=12)
+        response.raise_for_status()
+        return halving_context(int(response.text))
+    jobs=(fetch_json(client,'https://api.alternative.me/fng/',{'limit':1}),stablecoins(),halving())
+    results=await asyncio.gather(*jobs,return_exceptions=True)
+    previous=MACRO_CACHE['value']
+    current=dict(previous)
+    names=('fear_greed','stablecoins','halving')
+    for name,result in zip(names,results):
+        if isinstance(result,Exception):
+            LOG.warning('%s feed unavailable: %s',name,result)
+            continue
+        if name=='fear_greed':
+            try:
+                raw=result['data'][0]
+                v=int(raw['value'])
+                current[name]={'value':v,'classification':raw['value_classification'],
+                               'timestamp':int(raw['timestamp']),'signal':score_label((v-50)*2),
+                               'source':'Alternative.me · Fear & Greed'}
+            except (KeyError,ValueError,IndexError,TypeError):
+                LOG.warning('Fear & Greed response not valid')
+        else:
+            current[name]=result
+    MACRO_CACHE.update({'expires':time.monotonic()+600,'value':current})
+    return current
+
+
+def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spot_source='Binance spot', market_pair=None, macro=None):
+    macro=macro or {}
     c15=[x['close'] for x in k15]; c1=[x['close'] for x in k1h]; c4=[x['close'] for x in k4h]; cd=[x['close'] for x in kd]
     price=float(ticker['lastPrice'])
     daily_ma50=sum(cd[-50:])/50 if len(cd)>=50 else None
@@ -106,6 +185,14 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
     if daily_ma200: bias_parts.append((35, 1 if cd[-2]>daily_ma200 else -1))
     if daily_ma50 and daily_ma200: bias_parts.append((25,1 if daily_ma50>daily_ma200 else -1))
     if e4: bias_parts.append((40,1 if c4[-2]>e4 else -1))
+    fear=macro.get('fear_greed')
+    stable=macro.get('stablecoins')
+    if fear:
+        sentiment=(fear['value']-50)*2
+        bias_parts.append((10,1 if sentiment>=30 else -1 if sentiment<=-30 else 0))
+    if stable:
+        supply=stable['change30d']
+        bias_parts.append((10,1 if supply>=0.5 else -1 if supply<=-0.5 else 0))
     bias=round(sum(w*s for w,s in bias_parts)/sum(w for w,s in bias_parts)*100) if bias_parts else None
     bid_depth=sum(float(x[1]) for x in book.get('bids',[]))
     ask_depth=sum(float(x[1]) for x in book.get('asks',[]))
@@ -136,9 +223,16 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
         entry=price; stop=entry-side*max(1.5*a,price*.003)
         risk=abs(entry-stop)
         levels={'entry':round(entry,2),'stop':round(stop,2),'tp1':round(entry+side*risk,2),'tp2':round(entry+side*2*risk,2),'tp3':round(entry+side*3*risk,2),'status':'ILLUSTRATIVE / NOT CONFIRMED'}
+    zones=fvg_zones(k15[:-1])
+    nearby=[z for z in zones if z['status']=='open' and abs(price-(z['low']+z['high'])/2)/price<0.015]
+    closest=min(nearby,key=lambda z:abs(price-(z['low']+z['high'])/2)) if nearby else None
+    fvg_signal=('BUY' if closest['kind']=='bullish' else 'SELL') if closest else 'NEUTRAL'
+    support_signal='BUY' if price>resistance*1.002 else 'SELL' if price<support*0.998 else 'NEUTRAL'
+    rsi15=rsi(c15[:-1])
     indicators=[
         {'name':'200D Moving Average','value':f'${daily_ma200:,.0f}' if daily_ma200 else None,'signal':score_label(50 if daily_ma200 and price>daily_ma200 else -50 if daily_ma200 else None),'source':spot_source},
         {'name':'50D Moving Average','value':f'${daily_ma50:,.0f}' if daily_ma50 else None,'signal':score_label(50 if daily_ma50 and price>daily_ma50 else -50 if daily_ma50 else None),'source':spot_source},
+        {'name':'4H Trend','value':f'EMA21 ${e4:,.0f}' if e4 else None,'signal':score_label(50 if e4 and c4[-2]>e4 else -50 if e4 else None),'source':spot_source+' · 4H'},
         {'name':'Funding Rate','value':f'{float(funding)*100:.4f}%' if funding is not None else None,'signal':'NEUTRAL' if funding is not None else 'UNAVAILABLE','source':'Binance futures (if accessible)'},
         {'name':'Open Interest','value':f'{oi:,.0f} units' if oi is not None else None,'signal':'NEUTRAL' if oi is not None else 'UNAVAILABLE','source':'Binance futures (if accessible)'},
         {'name':'Order Book Imbalance','value':f'{imbalance*100:+.1f}%' if imbalance is not None else None,'signal':score_label(imbalance*400 if imbalance is not None else None),'source':spot_source+' top levels'},
@@ -146,8 +240,21 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
         {'name':'Recent Trade Delta (CVD proxy)','value':f'{trade_delta:+,.3f} units','signal':score_label(trade_imbalance*500 if trade_imbalance is not None else None),'source':spot_source+' recent trades'},
         {'name':'1H Momentum','value':f'{change1:+.2f}%' if change1 is not None else None,'signal':score_label(change1*100 if change1 is not None else None),'source':spot_source+' candles'},
         {'name':'15M Momentum','value':f'{change15:+.2f}%' if change15 is not None else None,'signal':score_label(change15*100 if change15 is not None else None),'source':spot_source+' candles'},
+        {'name':'15M RSI','value':f'{rsi15:.1f}' if rsi15 is not None else None,'signal':score_label((rsi15-50)*6 if rsi15 is not None else None),'source':spot_source+' · closed 15M'},
+        {'name':'Support / Resistance','value':f'${support:,.0f} / ${resistance:,.0f}','signal':support_signal,'source':spot_source+' · prior 1H levels'},
+        {'name':'Fair Value Gaps','value':f'{sum(z["status"]=="open" for z in zones)} open · 15M','signal':fvg_signal,'source':spot_source+' · 3-candle zones'},
     ]
-    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'levels':levels,'indicators':indicators,'chart':[{'ts':x['ts'],'close':x['close']} for x in k15[-96:]],'fvg':fvg_zones(k15[:-1]),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi(c15[:-1]),'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — premium feeds not connected','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'22-indicator market coverage and backtesting incomplete'}
+    if fear:
+        indicators.append({'name':'Fear & Greed','value':f'{fear["value"]}/100 · {fear["classification"]}',
+                           'signal':fear['signal'],'source':fear['source']+' · daily'})
+    if stable:
+        indicators.append({'name':'Stablecoin Supply (30D)','value':f'${stable["value"]/1e9:,.1f}B · {stable["change30d"]:+.2f}%',
+                           'signal':stable['signal'],'source':stable['source']+' · daily'})
+    halving=macro.get('halving')
+    if halving:
+        indicators.append({'name':'Bitcoin Halving Cycle','value':f'{halving["blocks_remaining"]:,} blocks left',
+                           'signal':'NEUTRAL','source':halving['source']+' · context only'})
+    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'indicators':indicators,'fvg':zones,'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Test confluence evaluated live; production-grade signal confirmation is pending validation'}
 
 
 def parse_klines(rows):
@@ -160,7 +267,7 @@ async def fetch_json(client,url,params=None):
     return r.json()
 
 
-async def fetch_asset_binance(client,symbol):
+async def fetch_asset_binance(client,symbol,macro=None):
     base='https://api.binance.com/api/v3/'
     fut='https://fapi.binance.com/fapi/v1/'
     queries=[fetch_json(client,base+'klines',{'symbol':symbol,'interval':tf,'limit':limit}) for tf,limit in [('15m',160),('1h',160),('4h',160),('1d',260)]]
@@ -171,7 +278,7 @@ async def fetch_asset_binance(client,symbol):
     k15,k1,k4,kd=[parse_klines(x) for x in out[:4]]
     funding=None if isinstance(out[7],Exception) else out[7].get('lastFundingRate')
     oi=None if isinstance(out[8],Exception) else float(out[8].get('openInterest',0))
-    return calc_asset(symbol,k15,k1,k4,kd,out[4],out[5],out[6],funding,oi,market_pair=symbol.replace('USDT','/USDT'))
+    return calc_asset(symbol,k15,k1,k4,kd,out[4],out[5],out[6],funding,oi,market_pair=symbol.replace('USDT','/USDT'),macro=macro)
 
 
 def kraken_result(payload):
@@ -191,7 +298,7 @@ def parse_kraken_ohlc(rows):
              'low':float(x[3]),'close':float(x[4]),'volume':float(x[6])} for x in rows]
 
 
-async def fetch_asset_kraken(client,symbol):
+async def fetch_asset_kraken(client,symbol,macro=None):
     """Public USD spot feed when Binance is geographically unavailable."""
     pair = 'XBTUSD' if symbol == 'BTCUSDT' else 'ETHUSD'
     base = 'https://api.kraken.com/0/public/'
@@ -211,33 +318,29 @@ async def fetch_asset_kraken(client,symbol):
     ticker = {'lastPrice':last_price,'priceChangePercent':change24h}
     trades = [{'qty':x[1],'isBuyerMaker':x[3]=='s'} for x in raw_trades]
     result = calc_asset(symbol,k15,k1,k4,kd,ticker,book,trades,None,None,
-                        spot_source='Kraken spot',market_pair=('BTC/USD' if symbol=='BTCUSDT' else 'ETH/USD'))
+                        spot_source='Kraken spot',market_pair=('BTC/USD' if symbol=='BTCUSDT' else 'ETH/USD'),macro=macro)
     result['change_approximate']=True
     result['provider_note']='Kraken USD spot; Binance unavailable on this deployment. No futures funding/OI.'
     return result
 
 
-async def fetch_asset(client,symbol):
+async def fetch_asset(client,symbol,macro=None):
     provider=os.getenv('MARKET_PROVIDER','auto').lower()
     if provider=='kraken':
-        return await fetch_asset_kraken(client,symbol)
+        return await fetch_asset_kraken(client,symbol,macro)
     if provider=='binance':
-        return await fetch_asset_binance(client,symbol)
+        return await fetch_asset_binance(client,symbol,macro)
     try:
-        return await fetch_asset_binance(client,symbol)
+        return await fetch_asset_binance(client,symbol,macro)
     except Exception as exc:
         LOG.warning('%s Binance unavailable, trying Kraken: %s',symbol,exc)
-        return await fetch_asset_kraken(client,symbol)
+        return await fetch_asset_kraken(client,symbol,macro)
 
 
 async def refresh():
-    async with httpx.AsyncClient(headers={'User-Agent':'BTC-Intelligence/0.1'}) as client:
-        results=await asyncio.gather(*(fetch_asset(client,s) for s in SYMBOLS),return_exceptions=True)
-        fg=None
-        try:
-            raw=await fetch_json(client,'https://api.alternative.me/fng/',{'limit':1})
-            fg={'value':int(raw['data'][0]['value']),'classification':raw['data'][0]['value_classification'],'updated':int(raw['data'][0]['timestamp'])}
-        except Exception as exc: LOG.warning('Fear/greed unavailable: %s',exc)
+    async with httpx.AsyncClient(headers={'User-Agent':'BTC-Intelligence/0.3'}) as client:
+        macro=await fetch_macro(client)
+        results=await asyncio.gather(*(fetch_asset(client,s,macro) for s in SYMBOLS),return_exceptions=True)
     async with LOCK:
         for symbol,result in zip(SYMBOLS,results):
             if isinstance(result,Exception):
@@ -246,7 +349,13 @@ async def refresh():
             else:
                 STATE['assets'][symbol]=result
                 STATE['source_errors'].pop(symbol,None)
-        STATE['fear_greed']=fg
+                history=STATE['decision_log'].setdefault(symbol,[])
+                ts=datetime.now(timezone.utc)
+                if not history or (ts-datetime.fromisoformat(history[0]['ts'])).total_seconds()>=300:
+                    history.insert(0,{'ts':ts.isoformat(),'direction':result['direction'],
+                                      'bias':result['bias'],'timing':result['timing']})
+                    del history[10:]
+        STATE['macro']=macro
         STATE['updated']=datetime.now(timezone.utc).isoformat()
 
 
@@ -281,7 +390,7 @@ async def lifespan(app):
     try: await wintermute_task
     except asyncio.CancelledError: pass
 
-app=FastAPI(title='BTC Intelligence',version='0.2.2',lifespan=lifespan)
+app=FastAPI(title='BTC Intelligence',version='0.3.0',lifespan=lifespan)
 
 
 @app.middleware('http')
