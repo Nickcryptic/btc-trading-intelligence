@@ -21,7 +21,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STATE = {'updated': None, 'assets': {}, 'fear_greed': None, 'source_errors': {}, 'wintermute': [], 'version': '0.2.0'}
+STATE = {'updated': None, 'assets': {}, 'fear_greed': None, 'source_errors': {}, 'wintermute': [], 'version': '0.2.1'}
 LOCK = asyncio.Lock()
 
 
@@ -225,7 +225,7 @@ async def lifespan(app):
     try: await wintermute_task
     except asyncio.CancelledError: pass
 
-app=FastAPI(title='BTC Intelligence',version='0.2.0',lifespan=lifespan)
+app=FastAPI(title='BTC Intelligence',version='0.2.1',lifespan=lifespan)
 
 
 @app.middleware('http')
