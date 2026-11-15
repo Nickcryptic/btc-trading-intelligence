@@ -1,4 +1,8 @@
-from app import ema, rsi, fvg_zones, score_label, kraken_result, parse_kraken_ohlc, parse_stablecoin_growth, halving_context, calc_asset
+import tempfile
+from pathlib import Path
+
+import app
+from app import ema, rsi, fvg_zones, score_label, kraken_result, parse_kraken_ohlc, parse_stablecoin_growth, halving_context, calc_asset, order_book_snapshot, observed_signal_status
 
 def test_ema_constant():
     assert ema([10]*30,21)==10
@@ -67,6 +71,9 @@ def test_provisional_confluence_requires_two_scores():
     assert result['test_confirmation'] is True
     assert result['confirmed'] is False
     assert result['levels']['tp1']>result['levels']['entry']>result['levels']['stop']
+    assert set(result['fvg_by_timeframe'])=={'15m','1h','1d'}
+    assert all(isinstance(result['fvg_by_timeframe'][tf],list) for tf in ('15m','1h','1d'))
+    assert result['order_book']['bid_share']>50
 
     # A bullish regime with bearish fast timing must produce no trade.
     negative_trades=[{'qty':'10','isBuyerMaker':True}]
@@ -76,3 +83,45 @@ def test_provisional_confluence_requires_two_scores():
     assert mixed['direction']=='NO TRADE'
     assert mixed['test_confirmation'] is False
     assert mixed['levels'] is None
+
+
+def test_order_book_depth_and_price_bands():
+    book={'bids':[['100','10'],['99.9','5']],'asks':[['100.1','2'],['100.2','1']]}
+    data=order_book_snapshot(book,100)
+    assert data['bid_share']>80
+    assert data['bids'][0]['price']==100
+    assert data['asks'][0]['price']==100.1
+    assert data['bid_usd']>data['ask_usd']
+    assert any(x['side']=='BID' for x in data['clusters'])
+    assert order_book_snapshot({'bids':[],'asks':[]},100) is None
+
+
+def test_signal_milestones_from_polled_prices():
+    long={'status':'TRACKING','side':'LONG','stop':95,'tp1':105,'tp2':110,'tp3':115}
+    assert observed_signal_status(long,104)=='TRACKING'
+    assert observed_signal_status(long,105)=='TP1 SEEN'
+    assert observed_signal_status({**long,'status':'TP1 SEEN'},94)=='SL AFTER TP1'
+    assert observed_signal_status(long,115)=='TP3 SEEN'
+    short={'status':'TRACKING','side':'SHORT','stop':105,'tp1':95,'tp2':90,'tp3':85}
+    assert observed_signal_status(short,94)=='TP1 SEEN'
+    assert observed_signal_status(short,106)=='SL SEEN'
+
+
+def test_signal_journal_de_duplicates_immediate_candidates():
+    previous_path=app.DB_PATH
+    with tempfile.TemporaryDirectory() as temp:
+        app.DB_PATH=Path(temp)/'signals-test.db'
+        try:
+            app.init_db()
+            levels={'entry':100,'stop':95,'tp1':105,'tp2':110,'tp3':115}
+            asset={'direction':'LONG CANDIDATE','levels':levels,'price':100,'bias':54,'timing':44}
+            first=app.record_signal_log('BTCUSDT',asset,'NO TRADE')
+            assert len(first)==1
+            assert first[0]['status']=='TRACKING'
+            second=app.record_signal_log('BTCUSDT',asset,'LONG CANDIDATE')
+            assert len(second)==1
+            asset['price']=106
+            reached=app.record_signal_log('BTCUSDT',asset,'LONG CANDIDATE')
+            assert reached[0]['status']=='TP1 SEEN'
+        finally:
+            app.DB_PATH=previous_path
