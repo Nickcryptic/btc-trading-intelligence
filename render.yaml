@@ -2,24 +2,14 @@ services:
   - type: web
     name: btc-intelligence-dashboard
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.11
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
-      - key: DASHBOARD_PASSWORD
-        sync: false
       - key: ALERTS_ENABLED
         value: 'false'
       - key: DB_PATH
-        value: /var/data/signals.db
-    disk:
-      name: dashboard-history
-      mountPath: /var/data
-      sizeGB: 1
+        value: /tmp/btc-intelligence-signals.db
