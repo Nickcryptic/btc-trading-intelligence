@@ -1,9 +1,107 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>BTC / ETH Market Intelligence</title><link rel="stylesheet" href="/static/style.css"></head><body>
-<header><div class="brand"><span class="logo">₿</span><div><strong>BTC <span class="accent">INTELLIGENCE</span></strong><small>MARKET ANALYTICS · v0.2.2</small></div></div><nav><span class="pill" id="connection">● Connecting</span><span class="muted">AUTO REFRESH · 120s</span><button id="reload">↻ Refresh</button></nav></header>
-<main><div class="page-title"><div><p class="eyebrow">INSTITUTIONAL-STYLE MARKET MONITOR</p><h1>Market Intelligence <span class="accent">Terminal</span></h1><p class="sub">Dual-score research framework · Bias + Timing must agree · No automated trading</p></div><div class="asset-switch"><button class="active" data-symbol="BTCUSDT">₿ BTC</button><button data-symbol="ETHUSDT">Ξ ETH</button></div></div>
-<section class="stats"><article class="card price"><label>LIVE PRICE</label><div class="big" id="price">—</div><span id="change">Waiting for exchange feed</span><small id="market-source">Waiting for spot exchange source</small></article><article class="card"><label>MARKET BIAS <span class="tag">SLOW</span></label><div class="big" id="bias">—</div><strong id="bias-label">Unavailable</strong><div class="meter"><div id="bias-bar"></div></div><small>Daily regime + 4H trend</small></article><article class="card"><label>TRADING TIMING <span class="tag">FAST</span></label><div class="big" id="timing">—</div><strong id="timing-label">Unavailable</strong><div class="meter"><div id="timing-bar"></div></div><small>1H / 15M + order flow</small></article><article class="card verdict"><label>DUAL-SCORE DECISION</label><div class="big" id="verdict">NO TRADE</div><strong>Requires agreement + risk validation</strong><small>Candidate signals are NOT confirmed alerts</small></article></section>
-<section class="grid"><article class="card chart-card"><div class="section-head"><div><h2>Price Action</h2><p>15-minute candles · recent closes</p></div><span class="tag">LIVE EXCHANGE DATA</span></div><canvas id="chart" width="860" height="290"></canvas><div class="inline-metrics"><span>SUPPORT <b id="support">—</b></span><span>RESISTANCE <b id="resistance">—</b></span><span>RSI (15M) <b id="rsi">—</b></span></div></article><article class="card trade-card"><div class="section-head"><div><h2>Trade Setup</h2><p>Indicative levels, not a confirmed signal</p></div><span class="tag warn">RESEARCH ONLY</span></div><div class="trade-direction" id="trade-direction">NO TRADE</div><div class="trade-row"><span>Entry</span><b id="entry">—</b></div><div class="trade-row"><span>Stop loss</span><b id="stop">—</b></div><div class="trade-row"><span>Take profit 1 · 1R</span><b id="tp1">—</b></div><div class="trade-row"><span>Take profit 2 · 2R</span><b id="tp2">—</b></div><div class="trade-row"><span>Take profit 3 · 3R</span><b id="tp3">—</b></div><div class="notice">Telegram alerts are disabled until signal validation, historical testing and bot credentials are configured.</div></article></section>
-<section class="grid"><article class="card"><div class="section-head"><div><h2>Live Indicator Signals</h2><p>Actual values and individual directional readings</p></div><span class="tag">VERIFIED FEEDS</span></div><div id="indicators" class="indicator-grid"></div></article><article class="card"><div class="section-head"><div><h2>Fair Value Gaps</h2><p>15M three-candle imbalances · open / filled</p></div></div><div id="fvg" class="fvg-list"></div></article></section>
-<section class="card"><div class="section-head"><div><h2>Complete Monitoring Coverage</h2><p>All agreed parameters are listed; missing paid or licensed feeds are clearly identified</p></div><span class="tag warn">DATA TRANSPARENCY</span></div><div id="coverage" class="coverage"></div></section>
-<section class="grid"><article class="card"><div class="section-head"><div><h2>Wintermute · Monitoring Only</h2><p>5-minute observations · last 10 · excluded from both scores</p></div><span class="tag warn">NOT CONNECTED</span></div><div id="wintermute-history" class="empty">Wallet attribution and verified order data source required. No fabricated BUY/SELL observations will be displayed.</div></article><article class="card"><div class="section-head"><div><h2>Signal History & Telegram</h2><p>Alerting and backtesting safeguards</p></div><span class="tag warn">DISABLED</span></div><div class="empty">No confirmed trade signals yet. Telegram is intentionally off until validation and credentials are configured.</div></article></section>
-<footer><span>BTC INTELLIGENCE · v0.2.2</span><span id="updated">Waiting for first data refresh</span><span>Research dashboard · Not financial advice</span></footer></main><script src="/static/app.js"></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08111f">
+  <meta name="description" content="BTC and ETH market confluence dashboard with market bias, trading timing, research signals, and transparent sources.">
+  <title>BTC Intelligence | Confluence Terminal</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.3.0</i></small></div></div>
+  <div class="top-right"><span class="live-badge" id="connection" role="status">● CONNECTING</span><span class="refresh-label">2 MIN AUTO REFRESH</span><button id="reload" class="icon-button" aria-label="Refresh market data">↻</button></div>
+</header>
+<main>
+  <section class="intro">
+    <div><p class="eyebrow"><span class="eyebrow-line"></span> INDEPENDENT MARKET INTELLIGENCE <span class="separator">/</span> RESEARCH MODE</p><h1>Decisions, <em>not distractions.</em></h1><p class="description">Slow market structure and fast execution timing must agree before a test setup appears.</p></div>
+    <div class="asset-switch" role="group" aria-label="Select market"><button data-symbol="BTCUSDT" class="active">₿ <span>Bitcoin</span><small>BTC</small></button><button data-symbol="ETHUSDT">Ξ <span>Ethereum</span><small>ETH</small></button></div>
+  </section>
+
+  <section class="market-strip" aria-label="Market status">
+    <div class="strip-item"><span>SPOT REFERENCE</span><b id="market-price">—</b><small id="market-source">Connecting market feed</small></div>
+    <div class="strip-item"><span>24H MOVEMENT</span><b id="market-change">—</b><small>Approximate when using Kraken candles</small></div>
+    <div class="strip-item"><span>DATA COVERAGE</span><b id="coverage-count">— / 23</b><small>Verified or explicitly partial categories</small></div>
+    <div class="strip-item"><span>LAST MARKET CHECK</span><b id="updated">Waiting…</b><small id="feed-note">Refreshes while this free server is awake</small></div>
+  </section>
+
+  <section class="decision-grid" aria-label="Research signal and dual scores">
+    <article class="signal-hero">
+      <div class="panel-top"><span class="eyebrow">01 / RESEARCH SIGNAL ENGINE</span><span class="badge amber">TEST MODE</span></div>
+      <div class="signal-status" id="signal-status">AWAITING ANALYSIS</div>
+      <p class="signal-explanation" id="signal-reason">Connecting data and checking both scoring timeframes…</p>
+      <div class="rule"></div>
+      <div class="gate-title">LIVE AGREEMENT CHECKS <span id="gate-result">0 / 3</span></div>
+      <div class="gate-list" id="signal-gates">
+        <div class="gate"><span class="gate-icon pending">·</span><span>Slow regime</span><strong>Checking</strong></div>
+        <div class="gate"><span class="gate-icon pending">·</span><span>Fast execution timing</span><strong>Checking</strong></div>
+        <div class="gate"><span class="gate-icon pending">·</span><span>Directional agreement</span><strong>Checking</strong></div>
+      </div>
+      <div class="signal-disclaimer">A passing agreement check is a <b>research candidate</b>, not a validated trade recommendation. No orders or Telegram alerts are sent.</div>
+    </article>
+
+    <div class="score-stack">
+      <article class="score-card bias-card">
+        <div class="score-top"><span><i class="score-dot purple"></i> MARKET BIAS</span><span class="time-tag">SLOW · 1D / 4H</span></div>
+        <div class="score-main"><strong id="bias">—</strong><span class="score-side" id="bias-label">Waiting</span></div>
+        <div class="score-track"><i id="bias-bar"></i></div>
+        <p>200-day regime · 50/200 trend · 4-hour EMA · available macro context</p>
+      </article>
+      <article class="score-card timing-card">
+        <div class="score-top"><span><i class="score-dot mint"></i> EXECUTION TIMING</span><span class="time-tag">FAST · 1H / 15M</span></div>
+        <div class="score-main"><strong id="timing">—</strong><span class="score-side" id="timing-label">Waiting</span></div>
+        <div class="score-track"><i id="timing-bar"></i></div>
+        <p>Hourly trend · 15-minute momentum · recent trade delta · depth imbalance</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="trade-panel">
+    <div class="section-heading"><div><p class="eyebrow">02 / CONDITIONAL TRADE PLAN</p><h2>Entry & risk framework</h2><p>Illustrative 1R / 2R / 3R targets appear only when both scores agree.</p></div><span class="badge" id="plan-status">AWAITING CONFLUENCE</span></div>
+    <div class="target-grid">
+      <div><label>ENTRY</label><strong id="entry">—</strong></div>
+      <div><label>STOP LOSS</label><strong id="stop">—</strong></div>
+      <div><label>TAKE PROFIT 01</label><strong id="tp1">—</strong></div>
+      <div><label>TAKE PROFIT 02</label><strong id="tp2">—</strong></div>
+      <div><label>TAKE PROFIT 03</label><strong id="tp3">—</strong></div>
+    </div>
+    <div class="plan-bottom"><span class="plan-icon">◎</span><span id="plan-reason">No levels until a research confluence is present.</span><span class="plan-mode">SIMULATION / NOT EXECUTABLE</span></div>
+  </section>
+
+  <section class="section-heading indicator-title"><div><p class="eyebrow">03 / THE EVIDENCE</p><h2>Individual indicator intelligence</h2><p>Every live indicator has a directional reading, source and relevant timeframe. Neutral does not mean missing.</p></div><span class="badge green">LIVE READINGS</span></section>
+  <section class="indicator-columns">
+    <article class="indicator-panel"><div class="indicator-header"><span class="section-number">A</span><div><h3>Structural & macro bias</h3><p>Slower indicators · 4H to multi-month</p></div></div><div id="slow-indicators" class="indicator-list"><p class="placeholder">Awaiting market data…</p></div></article>
+    <article class="indicator-panel"><div class="indicator-header"><span class="section-number mint-border">B</span><div><h3>Execution & order flow</h3><p>Faster indicators · 15M to 1H / snapshots</p></div></div><div id="fast-indicators" class="indicator-list"><p class="placeholder">Awaiting market data…</p></div></article>
+  </section>
+
+  <section class="context-grid">
+    <article class="context-card">
+      <div class="section-heading compact"><div><p class="eyebrow">04 / MARKET STRUCTURE</p><h2>Decision levels</h2></div><span class="badge">1H REACTIONS</span></div>
+      <div class="levels-pair"><div><small>KEY SUPPORT</small><strong id="support">—</strong></div><div><small>KEY RESISTANCE</small><strong id="resistance">—</strong></div></div>
+      <p class="muted-detail">Reference levels from recent completed hourly candles. They are not guaranteed to hold.</p>
+    </article>
+    <article class="context-card">
+      <div class="section-heading compact"><div><p class="eyebrow">05 / FAIR VALUE GAPS</p><h2>Open imbalance zones</h2></div><span class="badge">15M</span></div>
+      <div id="fvg" class="zone-list"><p class="placeholder">Checking gaps…</p></div>
+    </article>
+  </section>
+
+  <section class="history-grid">
+    <article class="lower-card">
+      <div class="section-heading compact"><div><p class="eyebrow">06 / OBSERVATIONS</p><h2>Last 10 research snapshots</h2><p>Five-minute decisions while the server is active.</p></div><span class="badge">PAPER LOG</span></div>
+      <div id="decision-history" class="history-list"><p class="placeholder">Waiting for first observation…</p></div>
+    </article>
+    <article class="lower-card">
+      <div class="section-heading compact"><div><p class="eyebrow">07 / MODEL COVERAGE</p><h2>23-parameter roadmap</h2><p>Available sources are separated from integrations we have not verified.</p></div><span class="badge amber" id="coverage-summary">PARTIAL</span></div>
+      <p class="coverage-intro">The missing data is <b>excluded from scores</b>. It isn't silently treated as a BUY or SELL.</p>
+      <details id="coverage-details"><summary>View all 23 parameters and connection status <span>＋</span></summary><div id="coverage" class="coverage-list"></div></details>
+      <details><summary>Wintermute monitoring-only observations <span>＋</span></summary><div id="wintermute-history" class="history-list muted-detail">Awaiting observations.</div></details>
+    </article>
+  </section>
+
+  <footer><div><strong>BTC INTELLIGENCE <span>v0.3.0</span></strong><p>Research software • no brokerage connection • no live trading or Telegram alerts.</p></div><div>Free Render hosting may sleep when inactive. Readings can become stale. <b>Not financial advice.</b></div></footer>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
