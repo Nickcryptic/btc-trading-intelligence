@@ -11,5 +11,7 @@ services:
         value: 3.11.11
       - key: ALERTS_ENABLED
         value: 'false'
+      - key: MARKET_PROVIDER
+        value: kraken
       - key: DB_PATH
         value: /tmp/btc-intelligence-signals.db
