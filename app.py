@@ -21,7 +21,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STATE = {'updated': None, 'assets': {}, 'fear_greed': None, 'source_errors': {}, 'wintermute': [], 'version': '0.2.1'}
+STATE = {'updated': None, 'assets': {}, 'fear_greed': None, 'source_errors': {}, 'wintermute': [], 'version': '0.2.2'}
 LOCK = asyncio.Lock()
 
 
@@ -95,7 +95,7 @@ def score_label(score):
     return 'NEUTRAL'
 
 
-def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi):
+def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spot_source='Binance spot', market_pair=None):
     c15=[x['close'] for x in k15]; c1=[x['close'] for x in k1h]; c4=[x['close'] for x in k4h]; cd=[x['close'] for x in kd]
     price=float(ticker['lastPrice'])
     daily_ma50=sum(cd[-50:])/50 if len(cd)>=50 else None
@@ -137,17 +137,17 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi):
         risk=abs(entry-stop)
         levels={'entry':round(entry,2),'stop':round(stop,2),'tp1':round(entry+side*risk,2),'tp2':round(entry+side*2*risk,2),'tp3':round(entry+side*3*risk,2),'status':'ILLUSTRATIVE / NOT CONFIRMED'}
     indicators=[
-        {'name':'200D Moving Average','value':f'${daily_ma200:,.0f}' if daily_ma200 else None,'signal':score_label(50 if daily_ma200 and price>daily_ma200 else -50 if daily_ma200 else None),'source':'Binance spot'},
-        {'name':'50D Moving Average','value':f'${daily_ma50:,.0f}' if daily_ma50 else None,'signal':score_label(50 if daily_ma50 and price>daily_ma50 else -50 if daily_ma50 else None),'source':'Binance spot'},
-        {'name':'Funding Rate','value':f'{float(funding)*100:.4f}%' if funding is not None else None,'signal':'NEUTRAL' if funding is not None else 'UNAVAILABLE','source':'Binance futures'},
-        {'name':'Open Interest','value':f'{oi:,.0f} units' if oi is not None else None,'signal':'NEUTRAL' if oi is not None else 'UNAVAILABLE','source':'Binance futures'},
-        {'name':'Order Book Imbalance','value':f'{imbalance*100:+.1f}%' if imbalance is not None else None,'signal':score_label(imbalance*400 if imbalance is not None else None),'source':'Binance top 100 levels'},
-        {'name':'Bid/Ask Spread','value':f'{spread:.2f} bps' if spread is not None else None,'signal':'NEUTRAL' if spread is not None else 'UNAVAILABLE','source':'Binance top of book'},
-        {'name':'Recent Trade Delta (CVD proxy)','value':f'{trade_delta:+,.3f} units','signal':score_label(trade_imbalance*500 if trade_imbalance is not None else None),'source':'Binance last 1000 trades'},
-        {'name':'1H Momentum','value':f'{change1:+.2f}%' if change1 is not None else None,'signal':score_label(change1*100 if change1 is not None else None),'source':'Binance candles'},
-        {'name':'15M Momentum','value':f'{change15:+.2f}%' if change15 is not None else None,'signal':score_label(change15*100 if change15 is not None else None),'source':'Binance candles'},
+        {'name':'200D Moving Average','value':f'${daily_ma200:,.0f}' if daily_ma200 else None,'signal':score_label(50 if daily_ma200 and price>daily_ma200 else -50 if daily_ma200 else None),'source':spot_source},
+        {'name':'50D Moving Average','value':f'${daily_ma50:,.0f}' if daily_ma50 else None,'signal':score_label(50 if daily_ma50 and price>daily_ma50 else -50 if daily_ma50 else None),'source':spot_source},
+        {'name':'Funding Rate','value':f'{float(funding)*100:.4f}%' if funding is not None else None,'signal':'NEUTRAL' if funding is not None else 'UNAVAILABLE','source':'Binance futures (if accessible)'},
+        {'name':'Open Interest','value':f'{oi:,.0f} units' if oi is not None else None,'signal':'NEUTRAL' if oi is not None else 'UNAVAILABLE','source':'Binance futures (if accessible)'},
+        {'name':'Order Book Imbalance','value':f'{imbalance*100:+.1f}%' if imbalance is not None else None,'signal':score_label(imbalance*400 if imbalance is not None else None),'source':spot_source+' top levels'},
+        {'name':'Bid/Ask Spread','value':f'{spread:.2f} bps' if spread is not None else None,'signal':'NEUTRAL' if spread is not None else 'UNAVAILABLE','source':spot_source+' top of book'},
+        {'name':'Recent Trade Delta (CVD proxy)','value':f'{trade_delta:+,.3f} units','signal':score_label(trade_imbalance*500 if trade_imbalance is not None else None),'source':spot_source+' recent trades'},
+        {'name':'1H Momentum','value':f'{change1:+.2f}%' if change1 is not None else None,'signal':score_label(change1*100 if change1 is not None else None),'source':spot_source+' candles'},
+        {'name':'15M Momentum','value':f'{change15:+.2f}%' if change15 is not None else None,'signal':score_label(change15*100 if change15 is not None else None),'source':spot_source+' candles'},
     ]
-    return {'symbol':symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'levels':levels,'indicators':indicators,'chart':[{'ts':x['ts'],'close':x['close']} for x in k15[-96:]],'fvg':fvg_zones(k15[:-1]),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi(c15[:-1]),'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — premium feeds not connected','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'22-indicator market coverage and backtesting incomplete'}
+    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'levels':levels,'indicators':indicators,'chart':[{'ts':x['ts'],'close':x['close']} for x in k15[-96:]],'fvg':fvg_zones(k15[:-1]),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi(c15[:-1]),'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — premium feeds not connected','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'22-indicator market coverage and backtesting incomplete'}
 
 
 def parse_klines(rows):
@@ -160,7 +160,7 @@ async def fetch_json(client,url,params=None):
     return r.json()
 
 
-async def fetch_asset(client,symbol):
+async def fetch_asset_binance(client,symbol):
     base='https://api.binance.com/api/v3/'
     fut='https://fapi.binance.com/fapi/v1/'
     queries=[fetch_json(client,base+'klines',{'symbol':symbol,'interval':tf,'limit':limit}) for tf,limit in [('15m',160),('1h',160),('4h',160),('1d',260)]]
@@ -171,7 +171,63 @@ async def fetch_asset(client,symbol):
     k15,k1,k4,kd=[parse_klines(x) for x in out[:4]]
     funding=None if isinstance(out[7],Exception) else out[7].get('lastFundingRate')
     oi=None if isinstance(out[8],Exception) else float(out[8].get('openInterest',0))
-    return calc_asset(symbol,k15,k1,k4,kd,out[4],out[5],out[6],funding,oi)
+    return calc_asset(symbol,k15,k1,k4,kd,out[4],out[5],out[6],funding,oi,market_pair=symbol.replace('USDT','/USDT'))
+
+
+def kraken_result(payload):
+    """Select a Kraken pair payload while rejecting API-level errors."""
+    if payload.get('error'):
+        raise RuntimeError('Kraken API: '+str(payload['error'])[:120])
+    result = payload.get('result', {})
+    pairs = [value for name,value in result.items() if name != 'last']
+    if len(pairs) != 1:
+        raise RuntimeError('Expected one Kraken market pair')
+    return pairs[0]
+
+
+def parse_kraken_ohlc(rows):
+    """Convert Kraken OHLC (seconds) into our candle format (milliseconds)."""
+    return [{'ts':int(x[0])*1000,'open':float(x[1]),'high':float(x[2]),
+             'low':float(x[3]),'close':float(x[4]),'volume':float(x[6])} for x in rows]
+
+
+async def fetch_asset_kraken(client,symbol):
+    """Public USD spot feed when Binance is geographically unavailable."""
+    pair = 'XBTUSD' if symbol == 'BTCUSDT' else 'ETHUSD'
+    base = 'https://api.kraken.com/0/public/'
+    queries = [fetch_json(client,base+'OHLC',{'pair':pair,'interval':interval}) for interval in (15,60,240,1440)]
+    queries += [fetch_json(client,base+endpoint,{'pair':pair,**extra}) for endpoint,extra in
+                [('Ticker',{}),('Depth',{'count':100}),('Trades',{'count':1000})]]
+    responses = await asyncio.gather(*queries,return_exceptions=True)
+    if any(isinstance(x,Exception) for x in responses):
+        raise RuntimeError('Kraken market feed unavailable: '+', '.join(str(x)[:80] for x in responses if isinstance(x,Exception)))
+    k15,k1,k4,kd = [parse_kraken_ohlc(kraken_result(x)) for x in responses[:4]]
+    if min(len(k15),len(k1),len(k4),len(kd)) < 201:
+        raise RuntimeError('Insufficient Kraken candle history for 200D regime')
+    raw_ticker, book, raw_trades = [kraken_result(x) for x in responses[4:]]
+    last_price = float(raw_ticker['c'][0])
+    # Kraken ticker's opening price is midnight UTC; calculate an approximate rolling 24h change instead.
+    change24h = (last_price/float(k1[-25]['close'])-1)*100
+    ticker = {'lastPrice':last_price,'priceChangePercent':change24h}
+    trades = [{'qty':x[1],'isBuyerMaker':x[3]=='s'} for x in raw_trades]
+    result = calc_asset(symbol,k15,k1,k4,kd,ticker,book,trades,None,None,
+                        spot_source='Kraken spot',market_pair=('BTC/USD' if symbol=='BTCUSDT' else 'ETH/USD'))
+    result['change_approximate']=True
+    result['provider_note']='Kraken USD spot; Binance unavailable on this deployment. No futures funding/OI.'
+    return result
+
+
+async def fetch_asset(client,symbol):
+    provider=os.getenv('MARKET_PROVIDER','auto').lower()
+    if provider=='kraken':
+        return await fetch_asset_kraken(client,symbol)
+    if provider=='binance':
+        return await fetch_asset_binance(client,symbol)
+    try:
+        return await fetch_asset_binance(client,symbol)
+    except Exception as exc:
+        LOG.warning('%s Binance unavailable, trying Kraken: %s',symbol,exc)
+        return await fetch_asset_kraken(client,symbol)
 
 
 async def refresh():
@@ -225,7 +281,7 @@ async def lifespan(app):
     try: await wintermute_task
     except asyncio.CancelledError: pass
 
-app=FastAPI(title='BTC Intelligence',version='0.2.1',lifespan=lifespan)
+app=FastAPI(title='BTC Intelligence',version='0.2.2',lifespan=lifespan)
 
 
 @app.middleware('http')
