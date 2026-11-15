@@ -22,7 +22,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'version': '0.4.0'}
+STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'version': '0.5.0'}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
 
@@ -128,6 +128,100 @@ def order_book_snapshot(book, price):
             'bid_share':round(bid_usd/total*100,1) if total else None,
             'bids':ladder(bids),'asks':ladder(asks),'clusters':clusters,
             'band_width':round(step,2)}
+
+
+def recent_tape_snapshot(trades, now=None):
+    """Observed taker-side trades in the last 120s; flag truncated REST batches."""
+    now=time.time() if now is None else now
+    start=now-120
+    valid=[]
+    for t in trades:
+        try:
+            timestamp=float(t['ts'])
+            if timestamp>1e12: timestamp/=1000  # Binance milliseconds
+            price=float(t['price']); qty=float(t['qty'])
+            if all(math.isfinite(x) for x in (timestamp,price,qty)) and price>0 and qty>0:
+                valid.append((timestamp,price*qty,bool(t['isBuyerMaker'])))
+        except (KeyError,TypeError,ValueError):
+            continue
+    if not valid:
+        return {'quality':'UNAVAILABLE','window_seconds':0,'trades':0,'buy_usd':0,'sell_usd':0,
+                'buy_share':None,'delta_usd':None}
+    selected=[x for x in valid if start<=x[0]<=now+5]
+    buy=sum(v for _,v,buyer_maker in selected if not buyer_maker)
+    sell=sum(v for _,v,buyer_maker in selected if buyer_maker)
+    total=buy+sell
+    span=min(120,max(0,now-min(ts for ts,_,_ in valid)))
+    complete=min(ts for ts,_,_ in valid)<=start
+    latest=max(ts for ts,_,_ in valid)
+    quality='COMPLETE' if complete and latest>=now-40 and len(selected)>=10 else 'PARTIAL'
+    return {'quality':quality,'window_seconds':round(span),'trades':len(selected),
+            'buy_usd':round(buy,2),'sell_usd':round(sell,2),
+            'buy_share':round(buy/total*100,1) if total else None,
+            'delta_usd':round(buy-sell,2) if total else None}
+
+
+def liquidity_observation(asset, previous=None):
+    """Independent book/tape pressure proxy; MUST NOT enter the final signal model."""
+    book=asset.get('order_book')
+    tape=asset.get('recent_tape') or {}
+    ts=asset['updated']
+    base={'ts':ts,'price':asset['price'],'pressure':'WARMING UP','score':None,
+          'bid_share':book.get('bid_share') if book else None,
+          'taker_buy_share':tape.get('buy_share'),
+          'tape_quality':tape.get('quality','UNAVAILABLE'),
+          'trade_count':tape.get('trades',0),'tape_seconds':tape.get('window_seconds',0),
+          'bid_delta_pct':None,'ask_delta_pct':None,'price_delta_pct':None,
+          'walls_retained':None,'walls_checked':None,'absorption':'NOT ESTABLISHED',
+          'reason':'Collecting a second comparable order-book snapshot. This monitor is separate from the trade decision.'}
+    if not book:
+        return {**base,'pressure':'UNAVAILABLE','reason':'No verified spot order book available.'}
+    if not previous or not previous.get('book_snapshot'):
+        return {**base,'book_snapshot':book}
+    seconds=(datetime.fromisoformat(ts)-datetime.fromisoformat(previous['ts'])).total_seconds()
+    if not 45<=seconds<=480:
+        return {**base,'book_snapshot':book,
+                'reason':'Snapshots are too far apart for a meaningful liquidity trend; collecting a new baseline.'}
+    old=previous['book_snapshot']
+    bid_change=(book['bid_usd']/old['bid_usd']-1)*100 if old['bid_usd'] else None
+    ask_change=(book['ask_usd']/old['ask_usd']-1)*100 if old['ask_usd'] else None
+    price_change=(asset['price']/previous['price']-1)*100 if previous['price'] else None
+    width=max(book['band_width'],old['band_width'])
+    old_clusters=old.get('clusters',[])
+    current_clusters=book.get('clusters',[])
+    retained=[c for c in old_clusters if any(n['side']==c['side'] and abs(n['price']-c['price'])<=width for n in current_clusters)]
+    score=(book['bid_share']-50)*1.4
+    if bid_change is not None and ask_change is not None:
+        score+=max(-35,min(35,(bid_change-ask_change)*0.5))
+    usable_tape=tape.get('quality')=='COMPLETE' and tape.get('buy_share') is not None
+    if usable_tape:
+        score+=(tape['buy_share']-50)*0.7
+    score=round(max(-100,min(100,score)))
+    pressure='BUY PRESSURE' if score>=22 else 'SELL PRESSURE' if score<=-22 else 'MIXED / NEUTRAL'
+    if bid_change is not None and ask_change is not None and bid_change<=-25 and ask_change<=-25:
+        pressure='LIQUIDITY WITHDRAWING'
+    buy_wall_retained=any(c['side']=='BID' for c in retained)
+    sell_wall_retained=any(c['side']=='ASK' for c in retained)
+    absorption='NOT ESTABLISHED'
+    if usable_tape and price_change is not None and abs(price_change)<=0.2:
+        if tape['buy_share']<=35 and bid_change is not None and bid_change>=-10 and buy_wall_retained:
+            absorption='POSSIBLE BUY ABSORPTION'
+        elif tape['buy_share']>=65 and ask_change is not None and ask_change>=-10 and sell_wall_retained:
+            absorption='POSSIBLE SELL ABSORPTION'
+    if pressure=='LIQUIDITY WITHDRAWING':
+        reason='Visible depth shrank on both sides since the prior poll; this can reflect cancellation, execution, or shifting price ranges.'
+    else:
+        reason=('Bid-side pressure has the stronger sampled evidence.' if pressure=='BUY PRESSURE' else
+                'Ask-side pressure has the stronger sampled evidence.' if pressure=='SELL PRESSURE' else
+                'Depth and taker flow are mixed or below the pressure threshold.')
+        if not usable_tape:
+            reason+=' Trade tape is incomplete or too thin, so its flow is excluded from this pressure score.'
+    return {**base,'book_snapshot':book,'pressure':pressure,'score':score,
+            'bid_delta_pct':round(bid_change,1) if bid_change is not None else None,
+            'ask_delta_pct':round(ask_change,1) if ask_change is not None else None,
+            'price_delta_pct':round(price_change,2) if price_change is not None else None,
+            'walls_retained':len(retained),'walls_checked':len(old_clusters),
+            'absorption':absorption,'reason':reason}
 
 
 def observed_signal_status(row, price):
@@ -344,7 +438,7 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
     if halving:
         indicators.append({'name':'Bitcoin Halving Cycle','value':f'{halving["blocks_remaining"]:,} blocks left',
                            'signal':'NEUTRAL','source':halving['source']+' · context only'})
-    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'indicators':indicators,'fvg':zones,'fvg_by_timeframe':zones_by_timeframe,'order_book':order_book_snapshot(book,price),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Test confluence evaluated live; production-grade signal confirmation is pending validation'}
+    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'indicators':indicators,'fvg':zones,'fvg_by_timeframe':zones_by_timeframe,'order_book':order_book_snapshot(book,price),'recent_tape':recent_tape_snapshot(trades),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Test confluence evaluated live; production-grade signal confirmation is pending validation'}
 
 
 def parse_klines(rows):
@@ -368,7 +462,8 @@ async def fetch_asset_binance(client,symbol,macro=None):
     k15,k1,k4,kd=[parse_klines(x) for x in out[:4]]
     funding=None if isinstance(out[7],Exception) else out[7].get('lastFundingRate')
     oi=None if isinstance(out[8],Exception) else float(out[8].get('openInterest',0))
-    return calc_asset(symbol,k15,k1,k4,kd,out[4],out[5],out[6],funding,oi,market_pair=symbol.replace('USDT','/USDT'),macro=macro)
+    trades=[{**t,'ts':t.get('time')} for t in out[6]]
+    return calc_asset(symbol,k15,k1,k4,kd,out[4],out[5],trades,funding,oi,market_pair=symbol.replace('USDT','/USDT'),macro=macro)
 
 
 def kraken_result(payload):
@@ -406,7 +501,7 @@ async def fetch_asset_kraken(client,symbol,macro=None):
     # Kraken ticker's opening price is midnight UTC; calculate an approximate rolling 24h change instead.
     change24h = (last_price/float(k1[-25]['close'])-1)*100
     ticker = {'lastPrice':last_price,'priceChangePercent':change24h}
-    trades = [{'qty':x[1],'isBuyerMaker':x[3]=='s'} for x in raw_trades]
+    trades = [{'price':x[0],'qty':x[1],'ts':x[2],'isBuyerMaker':x[3]=='s'} for x in raw_trades]
     result = calc_asset(symbol,k15,k1,k4,kd,ticker,book,trades,None,None,
                         spot_source='Kraken spot',market_pair=('BTC/USD' if symbol=='BTCUSDT' else 'ETH/USD'),macro=macro)
     result['change_approximate']=True
@@ -428,7 +523,7 @@ async def fetch_asset(client,symbol,macro=None):
 
 
 async def refresh():
-    async with httpx.AsyncClient(headers={'User-Agent':'BTC-Intelligence/0.4'}) as client:
+    async with httpx.AsyncClient(headers={'User-Agent':'BTC-Intelligence/0.5'}) as client:
         macro=await fetch_macro(client)
         results=await asyncio.gather(*(fetch_asset(client,s,macro) for s in SYMBOLS),return_exceptions=True)
     async with LOCK:
@@ -442,6 +537,11 @@ async def refresh():
                 STATE['source_errors'].pop(symbol,None)
                 STATE['signal_log'][symbol]=record_signal_log(symbol,result,previous)
                 STATE['previous_direction'][symbol]=result['direction']
+                liquidity_history=STATE['liquidity_history'].setdefault(symbol,[])
+                observation=liquidity_observation(result,liquidity_history[0] if liquidity_history else None)
+                liquidity_history.insert(0,observation)
+                del liquidity_history[10:]
+                STATE['liquidity_monitor'][symbol]={k:v for k,v in observation.items() if k!='book_snapshot'}
                 history=STATE['decision_log'].setdefault(symbol,[])
                 ts=datetime.now(timezone.utc)
                 if not history or (ts-datetime.fromisoformat(history[0]['ts'])).total_seconds()>=300:
@@ -483,7 +583,7 @@ async def lifespan(app):
     try: await wintermute_task
     except asyncio.CancelledError: pass
 
-app=FastAPI(title='BTC Intelligence',version='0.4.0',lifespan=lifespan)
+app=FastAPI(title='BTC Intelligence',version='0.5.0',lifespan=lifespan)
 
 
 @app.middleware('http')
@@ -511,7 +611,11 @@ async def health(): return {'ok':True,'version':STATE['version'],'updated':STATE
 @app.get('/api/state')
 async def state():
     async with LOCK:
-        return json.loads(json.dumps(STATE))
+        data=json.loads(json.dumps(STATE))
+        for rows in data['liquidity_history'].values():
+            for row in rows:
+                row.pop('book_snapshot',None)
+        return data
 
 @app.get('/api/signals')
 async def signals():
