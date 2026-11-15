@@ -1,6 +1,6 @@
-# BTC / ETH Market Intelligence — v0.2.1
+# BTC / ETH Market Intelligence — v0.2.2
 
-**Status: deployable first-stage dashboard, NOT a production-ready 23-feed trading system.** This release has a responsive UI, live Binance price/candle/depth/recent-trade data when accessible, 200D/50D trend, funding/OI (if Binance futures API accessible), 15M FVG detection, provisional two-score logic, and explicit unavailable indicators. It does **not** send trading alerts or place trades.
+**Status: deployable first-stage dashboard, NOT a production-ready 23-feed trading system.** This release has a responsive UI, public Kraken BTC/USD and ETH/USD spot price/candle/depth/recent-trade data on Render (or Binance BTC/USDT and ETH/USDT when accessible), 200D/50D trend, funding/OI only if Binance futures APIs are accessible, 15M FVG detection, provisional two-score logic, and explicit unavailable indicators. It does **not** send trading alerts or place trades. When Kraken is active, quoted prices and order-flow data are **USD markets**, not USDT, and 24-hour changes are approximate based on 1-hour candles.
 
 ## Local start
 
@@ -15,7 +15,7 @@ Open http://localhost:8000. The backend refreshes every 120 seconds. `/api/state
 
 ## Render deployment
 
-Connect the separate GitHub repository `Nickcryptic/btc-trading-intelligence`, then use Render > New > Blueprint and select `render.yaml`. The v0.2.1 blueprint uses a **free** web service with **no paid persistent disk**. A free instance can spin down when idle: no 2-minute background collection or alert delivery occurs while it sleeps, and there may be a cold start when reopening the dashboard. Local SQLite files on this tier are **ephemeral** and may be cleared on restart, redeploy or instance replacement. Keep one web worker so in-process monitoring does not duplicate polling. For 24/7 monitoring, use an always-on worker and a durable datastore after testing.
+Connect the separate GitHub repository `Nickcryptic/btc-trading-intelligence`, then use Render > New > Blueprint and select `render.yaml`. The v0.2.2 blueprint uses a **free** web service with **no paid persistent disk**. `MARKET_PROVIDER=kraken` avoids Binance's HTTP 451 region restriction on this Render host; set `MARKET_PROVIDER=auto` to try Binance first with a Kraken fallback. A free instance can spin down when idle: no 2-minute background collection or alert delivery occurs while it sleeps, and there may be a cold start when reopening the dashboard. Local SQLite files on this tier are **ephemeral** and may be cleared on restart, redeploy or instance replacement. Keep one web worker so in-process monitoring does not duplicate polling. For 24/7 monitoring, use an always-on worker and a durable datastore after testing.
 
 The free test blueprint creates a **public dashboard URL**. To protect the dashboard with HTTP Basic authentication, manually set `DASHBOARD_PASSWORD` in Render after deploying. The username is `trader`; never commit the password. Health endpoint remains accessible for Render's service checks. Telegram variables are not provisioned in the free test blueprint because no alerts are implemented.
 
