@@ -134,6 +134,34 @@ function renderOrderBook(asset){
   const strongest=Math.max(1,...clusters.map(x=>Number(x.usd)||0));
   $('cluster-list').innerHTML=clusters.length?clusters.map(row=>'<div class="cluster-row '+(row.side==='BID'?'bid':'ask')+'"><span class="cluster-side">'+htmlSafe(row.side)+'</span><div class="cluster-main"><div class="cluster-text"><b>'+usd(row.price)+'</b><span>'+(row.distance_pct>0?'+':'')+htmlSafe(row.distance_pct)+'% · '+compactUsd(row.usd)+'</span></div><div class="cluster-bar"><i style="width:'+(row.usd/strongest*100).toFixed(1)+'%"></i></div></div></div>').join(''):'<p class="placeholder">No price-band clusters detected.</p>';
 }
+function renderLiquidity(asset,stale){
+  const observation=current?.liquidity_monitor?.[selected];
+  const history=current?.liquidity_history?.[selected]||[];
+  const status=$('liquidity-state');
+  const statusText=!observation?'AWAITING DATA':stale?'STALE — WAIT FOR REFRESH':observation.pressure;
+  status.textContent=statusText+(observation&&typeof observation.score==='number'&&!stale?' · '+(observation.score>=0?'+':'')+observation.score:'');
+  status.className='liquidity-state '+(statusText==='BUY PRESSURE'?'buy':statusText==='SELL PRESSURE'?'sell':statusText==='LIQUIDITY WITHDRAWING'?'caution':statusText==='MIXED / NEUTRAL'?'neutral':'warming');
+  $('liquidity-reason').textContent=stale?'Snapshot is older than 5 minutes. Short-term liquidity comparisons are paused.':observation?.reason||'Waiting for the first exchange snapshot.';
+  function change(id,v){$(id).textContent=typeof v==='number'?(v>0?'+':'')+v.toFixed(1)+'%':'—';$(id).className=typeof v==='number'?(v>0?'up':v<0?'down':''):''}
+  change('liquidity-bid-change',observation?.bid_delta_pct);
+  change('liquidity-ask-change',observation?.ask_delta_pct);
+  const share=observation?.taker_buy_share;
+  $('liquidity-taker-share').textContent=typeof share==='number'?share.toFixed(1)+'%':'—';
+  $('liquidity-taker-share').className=typeof share==='number'?(share>=60?'up':share<=40?'down':''):'';
+  $('liquidity-tape-quality').textContent=observation?observation.tape_quality+' tape · '+observation.trade_count+' trades · '+observation.tape_seconds+'s window':'Waiting for trade tape';
+  $('liquidity-retained').textContent=observation&&observation.walls_checked!==null?observation.walls_retained+' / '+observation.walls_checked:'—';
+  const absorption=observation?.absorption||'NOT ESTABLISHED';
+  $('liquidity-absorption').textContent=absorption;
+  $('liquidity-absorption').className=absorption.includes('BUY')?'up':absorption.includes('SELL')?'down':'';
+  $('liquidity-price-drift').textContent='Price change: '+(typeof observation?.price_delta_pct==='number'?(observation.price_delta_pct>0?'+':'')+observation.price_delta_pct.toFixed(2)+'%':'—');
+  $('liquidity-history').innerHTML=history.length?history.slice(0,10).map(row=>{
+    const label=row.pressure||'UNAVAILABLE';
+    const tone=label==='BUY PRESSURE'?'buy':label==='SELL PRESSURE'?'sell':label==='LIQUIDITY WITHDRAWING'?'caution':'neutral';
+    const bid=typeof row.bid_share==='number'?row.bid_share.toFixed(1)+'%':'—';
+    const taker=typeof row.taker_buy_share==='number'?row.taker_buy_share.toFixed(1)+'%'+(row.tape_quality==='COMPLETE'?'':'*'):'—';
+    return '<div class="liquidity-sequence-row"><time>'+shortTime(row.ts)+'</time><span>'+bid+'</span><span>'+taker+'</span><b class="liq-label '+tone+'">'+htmlSafe(label)+'</b></div>';
+  }).join(''):'<p class="placeholder">The first observation will appear after a successful exchange poll.</p>';
+}
 function signalLogRows(){
   const fresh=current?.signal_log?.[selected]||[];
   let cached=[];
@@ -175,6 +203,7 @@ function renderAsset(asset){
   renderIndicators(asset);
   renderZones(asset);
   renderOrderBook(asset);
+  renderLiquidity(asset,stale);
   renderCoverage(asset);
   renderSignalLog();
 }
@@ -194,6 +223,7 @@ async function load(){
       $('signal-status').textContent='AWAITING DATA';
       $('signal-reason').textContent=current.source_errors?.[selected]||'Waiting for the first completed exchange refresh.';
       renderCoverage(null);
+      renderLiquidity(null,true);
     }
     renderHistory();
   }catch(error){
