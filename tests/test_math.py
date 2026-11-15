@@ -2,7 +2,7 @@ import tempfile
 from pathlib import Path
 
 import app
-from app import ema, rsi, fvg_zones, score_label, kraken_result, parse_kraken_ohlc, parse_stablecoin_growth, halving_context, calc_asset, order_book_snapshot, observed_signal_status
+from app import ema, rsi, fvg_zones, score_label, kraken_result, parse_kraken_ohlc, parse_stablecoin_growth, halving_context, calc_asset, order_book_snapshot, observed_signal_status, recent_tape_snapshot, liquidity_observation
 
 def test_ema_constant():
     assert ema([10]*30,21)==10
@@ -125,3 +125,34 @@ def test_signal_journal_de_duplicates_immediate_candidates():
             assert reached[0]['status']=='TP1 SEEN'
         finally:
             app.DB_PATH=previous_path
+
+
+def test_timestamped_taker_tape_quality():
+    now=1_700_000_000
+    trades=[{'price':100,'qty':1,'ts':now-130+i*7,'isBuyerMaker':i%3==0} for i in range(20)]
+    reading=recent_tape_snapshot(trades,now=now)
+    assert reading['quality']=='COMPLETE'
+    assert reading['trades']>=10
+    assert reading['buy_share']>50
+    assert reading['buy_usd']>reading['sell_usd']
+    limited=recent_tape_snapshot(trades[-3:],now=now)
+    assert limited['quality']=='PARTIAL'
+    assert recent_tape_snapshot([],now=now)['quality']=='UNAVAILABLE'
+
+
+def test_liquidity_monitor_is_separate_and_needs_history():
+    old=order_book_snapshot({'bids':[['100','10']],'asks':[['101','10']]},100.5)
+    new=order_book_snapshot({'bids':[['100','15']],'asks':[['101','7']]},100.5)
+    previous={'ts':'2026-11-15T00:00:00+00:00','price':100.5,'book_snapshot':old}
+    asset={'price':100.53,'updated':'2026-11-15T00:02:00+00:00','order_book':new,
+           'recent_tape':{'quality':'COMPLETE','buy_share':20,'trades':90,'window_seconds':120}}
+    first=liquidity_observation(asset)
+    assert first['pressure']=='WARMING UP'
+    monitor=liquidity_observation(asset,previous)
+    assert monitor['pressure']=='BUY PRESSURE'
+    assert monitor['bid_delta_pct']>0
+    assert monitor['ask_delta_pct']<0
+    assert monitor['absorption']=='POSSIBLE BUY ABSORPTION'
+    assert monitor['walls_retained']>0
+    old['bid_usd']=0  # empty historical depth must not cause division errors
+    assert liquidity_observation(asset,previous)['bid_delta_pct'] is None
