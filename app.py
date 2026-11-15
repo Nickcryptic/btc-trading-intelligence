@@ -22,7 +22,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'version': '0.5.0'}
+STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'version': '0.6.0'}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
 
@@ -110,15 +110,27 @@ def order_book_snapshot(book, price):
     total=bid_usd+ask_usd
     step=max(price*0.0005,0.01)  # 5-bp price bands, not liquidation estimates
     clusters=[]
+    cluster_map={'bids':[], 'asks':[]}
     for side,rows in (('BID',bids),('ASK',asks)):
         bands={}
         for p,q in rows:
             bucket=math.floor(p/step)
-            bands[bucket]=bands.get(bucket,0)+p*q
-        for bucket,amount in bands.items():
+            band=bands.setdefault(bucket,{'usd':0,'low':p,'high':p,'levels':0})
+            band['usd']+=p*q
+            band['low']=min(band['low'],p)
+            band['high']=max(band['high'],p)
+            band['levels']+=1
+        side_clusters=[]
+        for bucket,band in bands.items():
             level=round((bucket+0.5)*step,2)
-            clusters.append({'side':side,'price':level,'usd':round(amount,2),
-                             'distance_pct':round((level/price-1)*100,3)})
+            side_clusters.append({'side':side,'price':level,'usd':round(band['usd'],2),
+                                  'low':round(band['low'],2),'high':round(band['high'],2),
+                                  'levels':band['levels'],
+                                  'distance_pct':round(((band['low']+band['high'])/2/price-1)*100,3)})
+        clusters.extend(side_clusters)
+        # Preserve both sides even if one dominates the global top-eight ranking.
+        cluster_map['bids' if side=='BID' else 'asks']=sorted(
+            side_clusters,key=lambda x:x['usd'],reverse=True)[:6]
     clusters=sorted(clusters,key=lambda x:x['usd'],reverse=True)[:8]
     def ladder(rows):
         return [{'price':round(p,2),'quantity':round(q,6),'usd':round(p*q,2)} for p,q in rows[:7]]
@@ -127,6 +139,9 @@ def order_book_snapshot(book, price):
             'bid_usd':round(bid_usd,2),'ask_usd':round(ask_usd,2),
             'bid_share':round(bid_usd/total*100,1) if total else None,
             'bids':ladder(bids),'asks':ladder(asks),'clusters':clusters,
+            'cluster_map':cluster_map,
+            'coverage':{'low':round(bids[-1][0],2),'high':round(asks[-1][0],2),
+                        'bid_levels':len(bids),'ask_levels':len(asks)},
             'band_width':round(step,2)}
 
 

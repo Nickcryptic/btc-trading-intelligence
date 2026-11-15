@@ -118,7 +118,9 @@ function renderOrderBook(asset){
   if(!book){
     $('depth-summary').innerHTML='<p class="placeholder">No verified order-book snapshot from this feed.</p>';
     $('bid-ladder').innerHTML='';$('ask-ladder').innerHTML='';
-    $('cluster-list').innerHTML='<p class="placeholder">Liquidity bands need a valid spot order book.</p>';
+    $('cluster-coverage').textContent='Visible price range unavailable';
+    $('cluster-highlights').innerHTML='';
+    $('cluster-list').innerHTML='<p class="placeholder">Liquidity price levels need a valid spot order book.</p>';
     return;
   }
   const buy=Number(book.bid_share)||0;
@@ -130,9 +132,29 @@ function renderOrderBook(asset){
   function ladder(rows,side){return (rows||[]).map(row=>'<div class="ladder-row '+side+'"><span>'+usd(row.price)+'</span><div class="ladder-meter"><i style="width:'+(row.usd/max*100).toFixed(1)+'%"></i></div><b>'+compactUsd(row.usd)+'</b></div>').join('')||'<p class="placeholder">No levels</p>'}
   $('bid-ladder').innerHTML=ladder(book.bids,'bid');
   $('ask-ladder').innerHTML=ladder(book.asks,'ask');
-  const clusters=book.clusters||[];
-  const strongest=Math.max(1,...clusters.map(x=>Number(x.usd)||0));
-  $('cluster-list').innerHTML=clusters.length?clusters.map(row=>'<div class="cluster-row '+(row.side==='BID'?'bid':'ask')+'"><span class="cluster-side">'+htmlSafe(row.side)+'</span><div class="cluster-main"><div class="cluster-text"><b>'+usd(row.price)+'</b><span>'+(row.distance_pct>0?'+':'')+htmlSafe(row.distance_pct)+'% · '+compactUsd(row.usd)+'</span></div><div class="cluster-bar"><i style="width:'+(row.usd/strongest*100).toFixed(1)+'%"></i></div></div></div>').join(''):'<p class="placeholder">No price-band clusters detected.</p>';
+  const legacy=book.clusters||[];
+  const bids=book.cluster_map?.bids||legacy.filter(x=>x.side==='BID').slice(0,6);
+  const asks=book.cluster_map?.asks||legacy.filter(x=>x.side==='ASK').slice(0,6);
+  const strongest=Math.max(1,...[...bids,...asks].map(x=>Number(x.usd)||0));
+  const zonePrice=row=>{
+    const low=typeof row.low==='number'?row.low:row.price;
+    const high=typeof row.high==='number'?row.high:row.price;
+    return low===high?usd(low):usd(low)+' – '+usd(high);
+  };
+  const spotDistance=row=>{
+    const distance=Number(row.distance_pct);
+    return Number.isFinite(distance)?(distance>0?'+':'')+distance.toFixed(2)+'% vs spot':'Distance unavailable';
+  };
+  const coverage=book.coverage;
+  $('cluster-coverage').textContent=(coverage?'Visible depth range: '+usd(coverage.low)+' to '+usd(coverage.high)+' · '+coverage.bid_levels+' bid / '+coverage.ask_levels+' ask levels':'Visible exchange depth near current spot only')+(Date.now()-Date.parse(asset.updated)>300000?' · STALE SNAPSHOT':'');
+  const highlight=(wall,side)=>'<div class="wall-highlight '+side+'"><small>'+(side==='bid'?'LARGEST VISIBLE BUY WALL':'LARGEST VISIBLE SELL WALL')+'</small><strong>'+(wall?zonePrice(wall):'—')+'</strong><span>'+(wall?compactUsd(wall.usd)+' · '+spotDistance(wall):'No verified levels')+'</span></div>';
+  $('cluster-highlights').innerHTML=highlight(bids[0],'bid')+highlight(asks[0],'ask');
+  const wallRow=(row,side,largest)=>{
+    const width=Math.min(100,Math.max(0,(Number(row.usd)||0)/strongest*100));
+    return '<div class="wall-zone '+side+'"><div class="wall-zone-top"><div><strong>'+zonePrice(row)+'</strong><small>'+spotDistance(row)+(row.levels?' · '+htmlSafe(row.levels)+' price levels':'')+(row===largest?' · STRONGEST '+(side==='bid'?'BUY':'SELL'):'')+'</small></div><b>'+compactUsd(row.usd)+'</b></div><div class="wall-zone-bar"><i style="width:'+width.toFixed(1)+'%"></i></div></div>';
+  };
+  const wallSection=(rows,side)=>'<div class="wall-section-label '+side+'">'+(side==='ask'?'▲ SELL LIMIT ORDERS (ASKS)':'▼ BUY LIMIT ORDERS (BIDS)')+'<span>TOP '+rows.length+' BY VISIBLE USD</span></div>'+(rows.length?[...rows].sort((a,b)=>b.price-a.price).map(row=>wallRow(row,side,rows[0])).join(''):'<p class="placeholder">No '+side+' liquidity in this snapshot.</p>');
+  $('cluster-list').innerHTML=wallSection(asks,'ask')+'<div class="spot-price-anchor"><span>● CURRENT SPOT PRICE</span><strong>'+usd(asset.price)+'</strong></div>'+wallSection(bids,'bid');
 }
 function renderLiquidity(asset,stale){
   const observation=current?.liquidity_monitor?.[selected];

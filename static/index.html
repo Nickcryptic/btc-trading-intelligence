@@ -6,11 +6,11 @@
   <meta name="theme-color" content="#08111f">
   <meta name="description" content="BTC and ETH market confluence dashboard with market bias, trading timing, research signals, and transparent sources.">
   <title>BTC Intelligence | Confluence Terminal</title>
-  <link rel="stylesheet" href="/static/style.css?v=0.5.0">
+  <link rel="stylesheet" href="/static/style.css?v=0.6.0">
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.5.0</i></small></div></div>
+  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.6.0</i></small></div></div>
   <div class="top-right"><span class="live-badge" id="connection" role="status">● CONNECTING</span><div class="refresh-detail"><span class="refresh-label">2 MIN AUTO REFRESH</span><small id="updated-mini">Updated: awaiting feed</small></div><button id="reload" class="icon-button" aria-label="Refresh market data">↻</button></div>
 </header>
 <main>
@@ -102,9 +102,11 @@
       <p class="muted-detail">Displayed depth covers up to 100 resting spot price levels on each side. Orders can be cancelled without trading.</p>
     </article>
     <article class="context-card cluster-card">
-      <div class="section-heading compact"><div><p class="eyebrow">07 / LIQUIDITY CLUSTERS</p><h2>Where limit orders sit</h2><p>Highest-value spot order bands near market price</p></div><span class="badge">5 BP BANDS</span></div>
-      <div id="cluster-list" class="cluster-list"><p class="placeholder">Calculating resting-order clusters…</p></div>
-      <p class="muted-detail">These clusters are visible exchange limit orders, <b>not forced-liquidation levels</b>. Futures liquidation maps require a separate verified feed.</p>
+      <div class="section-heading compact"><div><p class="eyebrow">07 / LIQUIDITY PRICE MAP</p><h2>Where the buy & sell walls are</h2><p>Actual resting order price zones, relative to current spot</p></div><span class="badge">5 BP BANDS</span></div>
+      <div id="cluster-coverage" class="cluster-coverage">Waiting for visible price range…</div>
+      <div id="cluster-highlights" class="cluster-highlights"><p class="placeholder">Locating largest buy and sell walls…</p></div>
+      <div id="cluster-list" class="cluster-list"><p class="placeholder">Calculating resting-order price zones…</p></div>
+      <p class="muted-detail">Green = visible <b>buy limit orders (bids)</b>; red = visible <b>sell limit orders (asks)</b>. Shows up to six strongest 0.05% bands per side within the exchange's available top 100 levels. This is <b>not</b> a liquidation/stop-loss heatmap, and resting orders can disappear.</p>
     </article>
   </section>
 
@@ -143,8 +145,8 @@
     </article>
   </section>
 
-  <footer><div><strong>BTC INTELLIGENCE <span>v0.5.0</span></strong><p>Research software • no brokerage connection • no live trading or Telegram alerts.</p></div><div>Free Render hosting may sleep when inactive. Signal and liquidity history on the free server can reset after redeployment. <b>Not financial advice.</b></div></footer>
+  <footer><div><strong>BTC INTELLIGENCE <span>v0.6.0</span></strong><p>Research software • no brokerage connection • no live trading or Telegram alerts.</p></div><div>Free Render hosting may sleep when inactive. Signal and liquidity history on the free server can reset after redeployment. <b>Not financial advice.</b></div></footer>
 </main>
-<script src="/static/app.js?v=0.5.0"></script>
+<script src="/static/app.js?v=0.6.0"></script>
 </body>
 </html>

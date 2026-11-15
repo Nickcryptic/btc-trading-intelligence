@@ -93,7 +93,29 @@ def test_order_book_depth_and_price_bands():
     assert data['asks'][0]['price']==100.1
     assert data['bid_usd']>data['ask_usd']
     assert any(x['side']=='BID' for x in data['clusters'])
+    assert data['cluster_map']['bids'][0]['side']=='BID'
+    assert data['cluster_map']['asks'][0]['side']=='ASK'
+    assert data['coverage']=={'low':99.9,'high':100.2,'bid_levels':2,'ask_levels':2}
     assert order_book_snapshot({'bids':[],'asks':[]},100) is None
+
+
+def test_liquidity_map_keeps_both_sides_with_actual_price_ranges():
+    # A large number of heavy bid bands can occupy every globally ranked slot.
+    book={'bids':[[str(100-i*0.11),'10'] for i in range(12)],
+          'asks':[['100.5','0.01'],['100.51','0.02']]}
+    data=order_book_snapshot(book,100.25)
+    assert len(data['clusters'])==8
+    assert all(wall['side']=='BID' for wall in data['clusters'])
+    assert len(data['cluster_map']['bids'])==6
+    assert len(data['cluster_map']['asks'])>=1
+    assert all(wall['side']=='ASK' for wall in data['cluster_map']['asks'])
+    for side in ('bids','asks'):
+        for wall in data['cluster_map'][side]:
+            assert wall['low']<=wall['high']
+            assert wall['levels']>=1
+            assert wall['usd']>0
+    assert data['cluster_map']['asks'][0]['low'] in (100.5,100.51)
+    assert data['cluster_map']['asks'][0]['high'] in (100.5,100.51)
 
 
 def test_signal_milestones_from_polled_prices():
