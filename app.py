@@ -6,6 +6,7 @@ import math
 import os
 import sqlite3
 import time
+from statistics import median
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'version': '0.6.0'}
+STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'version': '0.7.0'}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
 
@@ -31,6 +32,10 @@ def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as db:
         db.execute('CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY, ts TEXT, symbol TEXT, side TEXT, entry REAL, stop REAL, tp1 REAL, tp2 REAL, tp3 REAL, bias REAL, timing REAL, status TEXT)')
+        # Keep old paper entries intact while distinguishing the new strategy.
+        columns={row[1] for row in db.execute('PRAGMA table_info(signals)')}
+        if 'strategy_version' not in columns:
+            db.execute("ALTER TABLE signals ADD COLUMN strategy_version TEXT DEFAULT 'LEGACY'")
         db.execute('CREATE TABLE IF NOT EXISTS wintermute (id INTEGER PRIMARY KEY, ts TEXT, signal TEXT, note TEXT)')
 
 
@@ -143,6 +148,93 @@ def order_book_snapshot(book, price):
             'coverage':{'low':round(bids[-1][0],2),'high':round(asks[-1][0],2),
                         'bid_levels':len(bids),'ask_levels':len(asks)},
             'band_width':round(step,2)}
+
+
+def wide_liquidity_snapshot(book, reference, source, quote='USD', max_levels=1000):
+    """Only report actual distant limit orders. Never extrapolate unobserved book depth."""
+    if not math.isfinite(reference) or reference<=0:
+        return None
+    sides={}
+    for name in ('bids','asks'):
+        valid=[]
+        for row in book.get(name,[])[:max_levels]:
+            try:
+                price,quantity=float(row[0]),float(row[1])
+                if math.isfinite(price) and math.isfinite(quantity) and price>0 and quantity>0:
+                    valid.append((price,quantity))
+            except (ValueError,TypeError,IndexError):
+                continue
+        sides[name]=sorted(valid,reverse=(name=='bids'))
+    if not sides['bids'] or not sides['asks'] or sides['bids'][0][0]>=sides['asks'][0][0]:
+        return None
+    step=reference*0.0025  # 0.25% wide bands: material distance rather than near-tick noise.
+    result={'source':source,'quote':quote,'reference_price':round(reference,2),
+            'range_min_pct':0.5,'range_max_pct':5.0,'band_pct':0.25,
+            'coverage':{'low':round(sides['bids'][-1][0],2),'high':round(sides['asks'][-1][0],2),
+                        'bid_levels':len(sides['bids']),'ask_levels':len(sides['asks'])},
+            'bids':[],'asks':[]}
+    for side,rows in sides.items():
+        bands={}
+        for p,q in rows:
+            distance=(p/reference-1)*100
+            # A bid above market or ask below market is not a valid distant wall.
+            if side=='bids' and not -5<=distance<=-0.5: continue
+            if side=='asks' and not 0.5<=distance<=5: continue
+            bucket=math.floor(p/step)
+            zone=bands.setdefault(bucket,{'notional':0,'low':p,'high':p,'levels':0})
+            zone['notional']+=p*q
+            zone['low']=min(zone['low'],p)
+            zone['high']=max(zone['high'],p)
+            zone['levels']+=1
+        zones=[]
+        for zone in bands.values():
+            midpoint=(zone['low']+zone['high'])/2
+            zones.append({'side':'BID' if side=='bids' else 'ASK',
+                          'price':round(midpoint,2),'low':round(zone['low'],2),
+                          'high':round(zone['high'],2),'usd':round(zone['notional'],2),
+                          'levels':zone['levels'],
+                          'distance_pct':round((midpoint/reference-1)*100,2)})
+        typical=median(z['usd'] for z in zones) if zones else 0
+        for zone in zones:
+            zone['relative_strength']=round(zone['usd']/typical,1) if typical else None
+        # Strongest six *within a verified distant range*; no invented liquidity.
+        result[side]=sorted(zones,key=lambda x:x['usd'],reverse=True)[:6]
+    return result
+
+
+def structure_liquidity_targets(k1h,k4h,price):
+    """Candle swing levels are *inferred potential stop targets*, not resting orders."""
+    pivots=[]
+    for timeframe,candles in (('1H',k1h[:-1][-145:]),('4H',k4h[:-1][-75:])):
+        for i in range(2,len(candles)-2):
+            window=candles[i-2:i+3]
+            candle=candles[i]
+            if all(candle['high']>c['high'] for j,c in enumerate(window) if j!=2):
+                pivots.append(('above',candle['high'],timeframe))
+            if all(candle['low']<c['low'] for j,c in enumerate(window) if j!=2):
+                pivots.append(('below',candle['low'],timeframe))
+    out={'above':[],'below':[]}
+    for side in out:
+        candidates=sorted((p,tf) for s,p,tf in pivots if s==side and
+                          0.65<=abs((p/price-1)*100)<=7 and
+                          ((p>price) if side=='above' else (p<price)))
+        zones=[]
+        for p,tf in candidates:
+            match=next((z for z in zones if abs(p/z['price']-1)<=0.003),None)
+            if match:
+                count=match['touches']
+                match['price']=(match['price']*count+p)/(count+1)
+                match['low']=min(match['low'],p)
+                match['high']=max(match['high'],p)
+                match['touches']+=1
+                if tf not in match['timeframes']:match['timeframes'].append(tf)
+            else:
+                zones.append({'price':p,'low':p,'high':p,'touches':1,'timeframes':[tf]})
+        for z in zones:
+            z['distance_pct']=round((z['price']/price-1)*100,2)
+            for key in ('price','low','high'): z[key]=round(z[key],2)
+        out[side]=sorted(zones,key=lambda z:(-min(4,z['touches']),abs(z['distance_pct'])))[:4]
+    return out
 
 
 def recent_tape_snapshot(trades, now=None):
@@ -275,11 +367,10 @@ def record_signal_log(symbol, asset, previous_direction):
             elapsed=(now-datetime.fromisoformat(last['ts'])).total_seconds() if last else float('inf')
             side='LONG' if direction.startswith('LONG') else 'SHORT'
             newly_issued=previous_direction!=direction
-            if not last or (newly_issued and (last['side']!=side or elapsed>=120)) or elapsed>=1800:
-                db.execute('INSERT INTO signals(ts,symbol,side,entry,stop,tp1,tp2,tp3,bias,timing,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            if not last or last['strategy_version']!='0.7.0' or (newly_issued and (last['side']!=side or elapsed>=120)) or elapsed>=1800:
+                db.execute('INSERT INTO signals(ts,symbol,side,entry,stop,tp1,tp2,tp3,bias,timing,status,strategy_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
                            (now.isoformat(),symbol,side,levels['entry'],levels['stop'],
-                            levels['tp1'],levels['tp2'],levels['tp3'],asset['bias'],asset['timing'],'TRACKING'))
-        db.execute('DELETE FROM signals WHERE id NOT IN (SELECT id FROM signals ORDER BY id DESC LIMIT 100)')
+                            levels['tp1'],levels['tp2'],levels['tp3'],asset['bias'],asset['timing'],'TRACKING','0.7.0'))
         return [dict(row) for row in db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5',(symbol,))]
 
 
@@ -371,23 +462,11 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
     macro=macro or {}
     c15=[x['close'] for x in k15]; c1=[x['close'] for x in k1h]; c4=[x['close'] for x in k4h]; cd=[x['close'] for x in kd]
     price=float(ticker['lastPrice'])
-    daily_ma50=sum(cd[-50:])/50 if len(cd)>=50 else None
-    daily_ma200=sum(cd[-200:])/200 if len(cd)>=200 else None
-    e1=ema(c1[-101:-1],21); e4=ema(c4[-101:-1],21)
-    # Bias uses closed candles, with daily regime and 4h trend; never fill missing inputs with fake values.
-    bias_parts=[]
-    if daily_ma200: bias_parts.append((35, 1 if cd[-2]>daily_ma200 else -1))
-    if daily_ma50 and daily_ma200: bias_parts.append((25,1 if daily_ma50>daily_ma200 else -1))
-    if e4: bias_parts.append((40,1 if c4[-2]>e4 else -1))
+    daily_ma50=sum(cd[-51:-1])/50 if len(cd)>=51 else None
+    daily_ma200=sum(cd[-201:-1])/200 if len(cd)>=201 else None
+    e1=ema(c1[:-1],21); e4=ema(c4[:-1],21)
     fear=macro.get('fear_greed')
     stable=macro.get('stablecoins')
-    if fear:
-        sentiment=(fear['value']-50)*2
-        bias_parts.append((10,1 if sentiment>=30 else -1 if sentiment<=-30 else 0))
-    if stable:
-        supply=stable['change30d']
-        bias_parts.append((10,1 if supply>=0.5 else -1 if supply<=-0.5 else 0))
-    bias=round(sum(w*s for w,s in bias_parts)/sum(w for w,s in bias_parts)*100) if bias_parts else None
     bid_depth=sum(float(x[1]) for x in book.get('bids',[]))
     ask_depth=sum(float(x[1]) for x in book.get('asks',[]))
     imbalance=(bid_depth-ask_depth)/(bid_depth+ask_depth) if bid_depth+ask_depth else None
@@ -399,24 +478,11 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
     trade_imbalance=(buy-sell)/(buy+sell) if buy+sell else None
     change1=(c1[-2]/c1[-3]-1)*100 if len(c1)>3 else None
     change15=(c15[-2]/c15[-3]-1)*100 if len(c15)>3 else None
-    timing_parts=[]
-    if e1: timing_parts.append((30,1 if c1[-2]>e1 else -1))
-    if change15 is not None: timing_parts.append((25,1 if change15>0 else -1 if change15<0 else 0))
-    if trade_imbalance is not None: timing_parts.append((25,max(-1,min(1,trade_imbalance*5))))
-    if imbalance is not None: timing_parts.append((20,max(-1,min(1,imbalance*4))))
-    timing=round(sum(w*s for w,s in timing_parts)/sum(w for w,s in timing_parts)*100) if timing_parts else None
-    direction='NO TRADE'
-    if bias is not None and timing is not None:
-        if bias>=30 and timing>=30: direction='LONG CANDIDATE'
-        if bias<=-30 and timing<=-30: direction='SHORT CANDIDATE'
-    a=atr(k15[:-1]); support=min(x['low'] for x in k1h[-26:-1]); resistance=max(x['high'] for x in k1h[-26:-1]);
-    # Candidate levels are indicative only; do not issue actionable alerts until validation gates exist.
-    levels=None
-    if direction!='NO TRADE' and a:
-        side=1 if direction.startswith('LONG') else -1
-        entry=price; stop=entry-side*max(1.5*a,price*.003)
-        risk=abs(entry-stop)
-        levels={'entry':round(entry,2),'stop':round(stop,2),'tp1':round(entry+side*risk,2),'tp2':round(entry+side*2*risk,2),'tp3':round(entry+side*3*risk,2),'status':'ILLUSTRATIVE / NOT CONFIRMED'}
+    support=min(x['low'] for x in k1h[-26:-1]); resistance=max(x['high'] for x in k1h[-26:-1]);
+    structure_targets=structure_liquidity_targets(k1h,k4h,price)
+    decision=professional_decision(k15,k1h,k4h,kd,price,spread,structure_targets)
+    bias=decision['bias']; timing=decision['timing']
+    direction=decision['direction']; levels=decision['levels']
     zones_by_timeframe={
         '15m':fvg_zones(k15[:-1],12),
         '1h':fvg_zones(k1h[:-1],12),
@@ -453,24 +519,157 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
     if halving:
         indicators.append({'name':'Bitcoin Halving Cycle','value':f'{halving["blocks_remaining"]:,} blocks left',
                            'signal':'NEUTRAL','source':halving['source']+' · context only'})
-    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'indicators':indicators,'fvg':zones,'fvg_by_timeframe':zones_by_timeframe,'order_book':order_book_snapshot(book,price),'recent_tape':recent_tape_snapshot(trades),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Test confluence evaluated live; production-grade signal confirmation is pending validation'}
+    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'signal_checks':decision['checks'],'setup_reason':decision['reason'],'setup_trigger':decision['trigger'],'setup_volume_ratio':decision['volume_ratio'],'structure_targets':structure_targets,'indicators':indicators,'fvg':zones,'fvg_by_timeframe':zones_by_timeframe,'order_book':order_book_snapshot(book,price),'recent_tape':recent_tape_snapshot(trades),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Strict trend/trigger/volume/risk rules evaluated live. Actual profitability has not been backtested or established.'}
 
 
 def parse_klines(rows):
     return [{'ts':int(x[0]),'open':float(x[1]),'high':float(x[2]),'low':float(x[3]),'close':float(x[4]),'volume':float(x[5])} for x in rows]
 
 
-async def fetch_json(client,url,params=None):
-    r=await client.get(url,params=params,timeout=12)
+async def fetch_json(client,url,params=None,timeout=12):
+    r=await client.get(url,params=params,timeout=timeout)
     r.raise_for_status()
     return r.json()
+
+
+def parse_bybit_wide_book(payload,symbol,now_ms=None):
+    """Reject API errors and stale/crossed snapshots rather than invent wall data."""
+    if payload.get('retCode')!=0:
+        raise RuntimeError('Bybit orderbook request rejected')
+    result=payload.get('result') or {}
+    if result.get('s')!=symbol:
+        raise RuntimeError('Bybit orderbook symbol mismatch')
+    now_ms=round(time.time()*1000) if now_ms is None else now_ms
+    ts=int(result['ts'])
+    if abs(now_ms-ts)>120000:
+        raise RuntimeError('Bybit orderbook timestamp is stale')
+    bids,asks=result['b'],result['a']
+    if not bids or not asks:
+        raise RuntimeError('Bybit orderbook is empty')
+    bid,ask=float(bids[0][0]),float(asks[0][0])
+    if not 0<bid<ask:
+        raise RuntimeError('Bybit orderbook is crossed or malformed')
+    return {'bids':bids,'asks':asks},(bid+ask)/2
+
+
+def build_broad_liquidity(payload,symbol,fallback_book,price,fallback_source):
+    if not isinstance(payload,Exception):
+        try:
+            wide,reference=parse_bybit_wide_book(payload,symbol)
+            return wide_liquidity_snapshot(wide,reference,
+                                           'Bybit spot · up to 1,000 levels per side','USDT')
+        except (KeyError,TypeError,ValueError,RuntimeError) as exc:
+            LOG.info('%s Bybit wide book unavailable: %s',symbol,exc)
+    return wide_liquidity_snapshot(fallback_book,price,fallback_source,'USD')
+
+
+def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
+    """Conservative, test-only trend/trigger/risk gates; scores are NOT win probabilities."""
+    result={'bias':None,'timing':None,'direction':'NO TRADE','levels':None,
+            'checks':[],'trigger':'NONE','volume_ratio':None,
+            'reason':'Insufficient completed candle history.'}
+    c15,c1,c4,cd=(k15[:-1],k1h[:-1],k4h[:-1],kd[:-1])
+    if min(len(c15),len(c1),len(c4))<70 or len(cd)<200 or price<=0:
+        return result
+    values=lambda rows:[c['close'] for c in rows]
+    v15,v1,v4,vd=map(values,(c15,c1,c4,cd))
+    ma200=sum(vd[-200:])/200
+    ma50=sum(vd[-50:])/50
+    e4=ema(v4,21); e4past=ema(v4[:-4],21)
+    e1=ema(v1,21); e1past=ema(v1[:-4],21); e1slow=ema(v1,55)
+    e9=ema(v15,9); e21=ema(v15,21)
+    rsi15=rsi(v15)
+    direction=lambda bullish,bearish:1 if bullish else -1 if bearish else 0
+    daily=direction(vd[-1]>ma200,vd[-1]<ma200)
+    cross=direction(ma50>ma200,ma50<ma200)
+    four=direction(v4[-1]>e4 and e4>e4past,v4[-1]<e4 and e4<e4past)
+    hour=direction(v1[-1]>e1>e1slow and e1>e1past,
+                   v1[-1]<e1<e1slow and e1<e1past)
+    fifteen=direction(v15[-1]>e9>e21,v15[-1]<e9<e21)
+    healthy_rsi=direction(52<=rsi15<=80,20<=rsi15<=48)
+    hour_momentum=direction(v1[-1]>v1[-5],v1[-1]<v1[-5])
+    bias=round(30*daily+25*cross+45*four)
+    timing=round(35*hour+30*fifteen+20*healthy_rsi+15*hour_momentum)
+    result.update({'bias':bias,'timing':timing})
+
+    side=1 if bias>=55 and timing>=55 else -1 if bias<=-55 and timing<=-55 else 0
+    regime=side!=0 and daily==four==side
+    execution=side!=0 and hour==fifteen==healthy_rsi==side
+    last=c15[-1]; previous=c15[-17:-1]
+    prior_high=max(c['high'] for c in previous)
+    prior_low=min(c['low'] for c in previous)
+    a=atr(c15)
+    typical_volume=median(c['volume'] for c in c15[-21:-1])
+    ratio=last['volume']/typical_volume if typical_volume>0 else 0
+    result['volume_ratio']=round(ratio,2)
+    trend_check=bool(regime and execution)
+    trigger='NONE'
+    body=abs(last['close']-last['open'])
+    if a and body>=0.2*a:
+        if side==1 and last['close']>last['open']:
+            if last['close']>prior_high+0.05*a:trigger='15M BREAKOUT'
+            elif last['low']<prior_low-0.05*a and last['close']>prior_low+0.05*a:trigger='15M SWEEP / RECLAIM'
+            elif last['low']<=e21+0.1*a and last['close']>c15[-2]['high'] and last['close']>e9:
+                trigger='15M TREND PULLBACK'
+        if side==-1 and last['close']<last['open']:
+            if last['close']<prior_low-0.05*a:trigger='15M BREAKDOWN'
+            elif last['high']>prior_high+0.05*a and last['close']<prior_high-0.05*a:trigger='15M SWEEP / REJECTION'
+            elif last['high']>=e21-0.1*a and last['close']<c15[-2]['low'] and last['close']<e9:
+                trigger='15M TREND PULLBACK'
+    result['trigger']=trigger
+    participation=ratio>=1.15
+    volatility=bool(a and 0.08<=a/price*100<=2.5)
+    not_chasing=bool(a and abs(price-last['close'])<=0.8*a and
+                    abs(last['close']-e21)<=3*a)
+    spread_ok=spread is not None and 0<=spread<=3
+    entry_quality=volatility and not_chasing and spread_ok
+    proposed=None
+    risk_ok=False
+    room_ok=True
+    if side and a:
+        entry=price
+        if side==1:
+            stop=min(min(c['low'] for c in c15[-10:])-0.25*a,entry-1.2*a)
+        else:
+            stop=max(max(c['high'] for c in c15[-10:])+0.25*a,entry+1.2*a)
+        risk=abs(entry-stop)
+        risk_ok=0.15<=risk/entry*100<=1.8
+        if targets:
+            opposite='above' if side==1 else 'below'
+            candidates=[z for z in targets.get(opposite,[]) if z['touches']>=2 and
+                        ((z['low']>entry) if side==1 else (z['high']<entry))]
+            if candidates:
+                nearest=min(candidates,key=lambda z:abs(z['price']-entry))
+                distance=abs((nearest['low'] if side==1 else nearest['high'])-entry)
+                room_ok=distance>=1.5*risk
+        proposed={'entry':round(entry,2),'stop':round(stop,2),
+                  'tp1':round(entry+side*risk,2),
+                  'tp2':round(entry+side*2*risk,2),
+                  'tp3':round(entry+side*3*risk,2),
+                  'status':'ILLUSTRATIVE / NOT CONFIRMED'}
+    checks=[
+        {'label':'1D + 4H regime', 'ok':bool(regime),'detail':('ALIGNED' if regime else 'NOT ALIGNED')},
+        {'label':'1H + 15M trend', 'ok':bool(execution),'detail':('ALIGNED' if execution else 'NOT ALIGNED')},
+        {'label':'15M price-action trigger', 'ok':trigger!='NONE','detail':trigger if trigger!='NONE' else 'NOT TRIGGERED'},
+        {'label':'15M volume confirmation', 'ok':participation,'detail':f'{ratio:.2f}× vs median'},
+        {'label':'Spread + ATR + no chase','ok':entry_quality,'detail':'ACCEPTABLE' if entry_quality else 'FILTERED'},
+        {'label':'Stop size + target room','ok':risk_ok and room_ok,
+         'detail':'ACCEPTABLE' if risk_ok and room_ok else 'RISK / ROOM FILTER'}]
+    result['checks']=checks
+    failed=next((c for c in checks if not c['ok']),None)
+    if not failed:
+        result.update({'direction':'LONG CANDIDATE' if side==1 else 'SHORT CANDIDATE',
+                       'levels':proposed,'reason':f'{trigger} confirmed by trend, volume and risk gates. Paper candidate only.'})
+    else:
+        result['reason']=f'No trade: {failed["label"].lower()} — {failed["detail"].lower()}.'
+    return result
 
 
 async def fetch_asset_binance(client,symbol,macro=None):
     base='https://api.binance.com/api/v3/'
     fut='https://fapi.binance.com/fapi/v1/'
     queries=[fetch_json(client,base+'klines',{'symbol':symbol,'interval':tf,'limit':limit}) for tf,limit in [('15m',160),('1h',160),('4h',160),('1d',260)]]
-    queries += [fetch_json(client,base+'ticker/24hr',{'symbol':symbol}),fetch_json(client,base+'depth',{'symbol':symbol,'limit':100}),fetch_json(client,base+'trades',{'symbol':symbol,'limit':1000}),fetch_json(client,fut+'premiumIndex',{'symbol':symbol}),fetch_json(client,fut+'openInterest',{'symbol':symbol})]
+    queries += [fetch_json(client,base+'ticker/24hr',{'symbol':symbol}),fetch_json(client,base+'depth',{'symbol':symbol,'limit':1000}),fetch_json(client,base+'trades',{'symbol':symbol,'limit':1000}),fetch_json(client,fut+'premiumIndex',{'symbol':symbol}),fetch_json(client,fut+'openInterest',{'symbol':symbol}),fetch_json(client,'https://api.bybit.com/v5/market/orderbook',{'category':'spot','symbol':symbol,'limit':1000},timeout=5)]
     out=await asyncio.gather(*queries,return_exceptions=True)
     if any(isinstance(x,Exception) for x in out[:7]):
         raise RuntimeError('Core market feed unavailable: '+', '.join(str(x)[:80] for x in out[:7] if isinstance(x,Exception)))
@@ -478,7 +677,9 @@ async def fetch_asset_binance(client,symbol,macro=None):
     funding=None if isinstance(out[7],Exception) else out[7].get('lastFundingRate')
     oi=None if isinstance(out[8],Exception) else float(out[8].get('openInterest',0))
     trades=[{**t,'ts':t.get('time')} for t in out[6]]
-    return calc_asset(symbol,k15,k1,k4,kd,out[4],out[5],trades,funding,oi,market_pair=symbol.replace('USDT','/USDT'),macro=macro)
+    asset=calc_asset(symbol,k15,k1,k4,kd,out[4],out[5],trades,funding,oi,market_pair=symbol.replace('USDT','/USDT'),macro=macro)
+    asset['liquidity_map']=build_broad_liquidity(out[9],symbol,out[5],asset['price'],'Binance spot · up to 1,000 levels per side')
+    return asset
 
 
 def kraken_result(payload):
@@ -504,14 +705,16 @@ async def fetch_asset_kraken(client,symbol,macro=None):
     base = 'https://api.kraken.com/0/public/'
     queries = [fetch_json(client,base+'OHLC',{'pair':pair,'interval':interval}) for interval in (15,60,240,1440)]
     queries += [fetch_json(client,base+endpoint,{'pair':pair,**extra}) for endpoint,extra in
-                [('Ticker',{}),('Depth',{'count':100}),('Trades',{'count':1000})]]
+                [('Ticker',{}),('Depth',{'count':500}),('Trades',{'count':1000})]]
+    queries.append(fetch_json(client,'https://api.bybit.com/v5/market/orderbook',
+                              {'category':'spot','symbol':symbol,'limit':1000},timeout=5))
     responses = await asyncio.gather(*queries,return_exceptions=True)
-    if any(isinstance(x,Exception) for x in responses):
-        raise RuntimeError('Kraken market feed unavailable: '+', '.join(str(x)[:80] for x in responses if isinstance(x,Exception)))
+    if any(isinstance(x,Exception) for x in responses[:7]):
+        raise RuntimeError('Kraken market feed unavailable: '+', '.join(str(x)[:80] for x in responses[:7] if isinstance(x,Exception)))
     k15,k1,k4,kd = [parse_kraken_ohlc(kraken_result(x)) for x in responses[:4]]
     if min(len(k15),len(k1),len(k4),len(kd)) < 201:
         raise RuntimeError('Insufficient Kraken candle history for 200D regime')
-    raw_ticker, book, raw_trades = [kraken_result(x) for x in responses[4:]]
+    raw_ticker, book, raw_trades = [kraken_result(x) for x in responses[4:7]]
     last_price = float(raw_ticker['c'][0])
     # Kraken ticker's opening price is midnight UTC; calculate an approximate rolling 24h change instead.
     change24h = (last_price/float(k1[-25]['close'])-1)*100
@@ -519,6 +722,8 @@ async def fetch_asset_kraken(client,symbol,macro=None):
     trades = [{'price':x[0],'qty':x[1],'ts':x[2],'isBuyerMaker':x[3]=='s'} for x in raw_trades]
     result = calc_asset(symbol,k15,k1,k4,kd,ticker,book,trades,None,None,
                         spot_source='Kraken spot',market_pair=('BTC/USD' if symbol=='BTCUSDT' else 'ETH/USD'),macro=macro)
+    result['liquidity_map']=build_broad_liquidity(responses[7],symbol,book,last_price,
+                                                'Kraken spot · up to 500 levels per side')
     result['change_approximate']=True
     result['provider_note']='Kraken USD spot; Binance unavailable on this deployment. No futures funding/OI.'
     return result
@@ -538,7 +743,7 @@ async def fetch_asset(client,symbol,macro=None):
 
 
 async def refresh():
-    async with httpx.AsyncClient(headers={'User-Agent':'BTC-Intelligence/0.5'}) as client:
+    async with httpx.AsyncClient(headers={'User-Agent':'BTC-Intelligence/0.7'}) as client:
         macro=await fetch_macro(client)
         results=await asyncio.gather(*(fetch_asset(client,s,macro) for s in SYMBOLS),return_exceptions=True)
     async with LOCK:
@@ -598,7 +803,7 @@ async def lifespan(app):
     try: await wintermute_task
     except asyncio.CancelledError: pass
 
-app=FastAPI(title='BTC Intelligence',version='0.5.0',lifespan=lifespan)
+app=FastAPI(title='BTC Intelligence',version='0.7.0',lifespan=lifespan)
 
 
 @app.middleware('http')

@@ -6,11 +6,11 @@
   <meta name="theme-color" content="#08111f">
   <meta name="description" content="BTC and ETH market confluence dashboard with market bias, trading timing, research signals, and transparent sources.">
   <title>BTC Intelligence | Confluence Terminal</title>
-  <link rel="stylesheet" href="/static/style.css?v=0.6.0">
+  <link rel="stylesheet" href="/static/style.css?v=0.7.0">
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.6.0</i></small></div></div>
+  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.7.0</i></small></div></div>
   <div class="top-right"><span class="live-badge" id="connection" role="status">● CONNECTING</span><div class="refresh-detail"><span class="refresh-label">2 MIN AUTO REFRESH</span><small id="updated-mini">Updated: awaiting feed</small></div><button id="reload" class="icon-button" aria-label="Refresh market data">↻</button></div>
 </header>
 <main>
@@ -32,13 +32,13 @@
       <div class="signal-status" id="signal-status">AWAITING ANALYSIS</div>
       <p class="signal-explanation" id="signal-reason">Connecting data and checking both scoring timeframes…</p>
       <div class="rule"></div>
-      <div class="gate-title">LIVE AGREEMENT CHECKS <span id="gate-result">0 / 3</span></div>
+      <div class="gate-title">SIX TRADE-QUALITY CHECKS <span id="gate-result">0 / 6</span></div>
       <div class="gate-list" id="signal-gates">
         <div class="gate"><span class="gate-icon pending">·</span><span>Slow regime</span><strong>Checking</strong></div>
         <div class="gate"><span class="gate-icon pending">·</span><span>Fast execution timing</span><strong>Checking</strong></div>
         <div class="gate"><span class="gate-icon pending">·</span><span>Directional agreement</span><strong>Checking</strong></div>
       </div>
-      <div class="signal-disclaimer">A passing agreement check is a <b>research candidate</b>, not a validated trade recommendation. No orders or Telegram alerts are sent.</div>
+      <div class="signal-disclaimer">A completed six-check setup is only a <b>research candidate</b>, not a proven trading edge. Scores measure rule alignment, <b>not win probability</b>. No orders or Telegram alerts are sent.</div>
     </article>
 
     <div class="score-stack">
@@ -46,19 +46,19 @@
         <div class="score-top"><span><i class="score-dot purple"></i> MARKET BIAS</span><span class="time-tag">SLOW · 1D / 4H</span></div>
         <div class="score-main"><strong id="bias">—</strong><span class="score-side" id="bias-label">Waiting</span></div>
         <div class="score-track"><i id="bias-bar"></i></div>
-        <p>200-day regime · 50/200 trend · 4-hour EMA · available macro context</p>
+        <p>Closed daily candles · 50/200-day regime · 4H EMA direction and slope</p>
       </article>
       <article class="score-card timing-card">
         <div class="score-top"><span><i class="score-dot mint"></i> EXECUTION TIMING</span><span class="time-tag">FAST · 1H / 15M</span></div>
         <div class="score-main"><strong id="timing">—</strong><span class="score-side" id="timing-label">Waiting</span></div>
         <div class="score-track"><i id="timing-bar"></i></div>
-        <p>Hourly trend · 15-minute momentum · recent trade delta · depth imbalance</p>
+        <p>1H EMA alignment · 15M EMA trend · RSI · hourly momentum; no order-book noise</p>
       </article>
     </div>
   </section>
 
   <section class="trade-panel">
-    <div class="section-heading"><div><p class="eyebrow">02 / CONDITIONAL TRADE PLAN</p><h2>Entry & risk framework</h2><p>Illustrative 1R / 2R / 3R targets appear only when both scores agree.</p></div><span class="badge" id="plan-status">AWAITING CONFLUENCE</span></div>
+    <div class="section-heading"><div><p class="eyebrow">02 / CONDITIONAL TRADE PLAN</p><h2>Entry & risk framework</h2><p>Illustrative 1R / 2R / 3R targets appear only after trend, entry trigger, volume and risk checks pass.</p></div><span class="badge" id="plan-status">AWAITING CONFLUENCE</span></div>
     <div class="target-grid">
       <div><label>ENTRY</label><strong id="entry">—</strong></div>
       <div><label>STOP LOSS</label><strong id="stop">—</strong></div>
@@ -69,7 +69,7 @@
     <div class="plan-bottom"><span class="plan-icon">◎</span><span id="plan-reason">No levels until a research confluence is present.</span><span class="plan-mode">SIMULATION / NOT EXECUTABLE</span></div>
     <div class="trade-log-wrap">
       <div class="trade-log-title"><div><span class="eyebrow">TEST SIGNAL JOURNAL</span><h3>Latest 5 signal entries <span id="signal-log-symbol">BTC</span></h3></div><span class="badge">UTC · OBSERVED PRICES</span></div>
-      <p class="muted-detail">A new entry appears when a candidate changes, or every 30 minutes while it persists. Outcomes reflect sampled spot prices—not verified fills or backtested profit.</p>
+      <p class="muted-detail">The strategy now requires a completed 15M breakout, sweep/reclaim or trend-pullback trigger with volume and risk controls. Signals are sampled paper candidates; outcomes are observed prices, not fills or demonstrated profit.</p>
       <div class="trade-log-scroll"><table class="trade-log-table"><thead><tr><th>Issued (UTC)</th><th>Side</th><th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>Stop</th><th>Observed result</th></tr></thead><tbody id="signal-log"><tr><td colspan="8">Waiting for first test signal…</td></tr></tbody></table></div>
     </div>
   </section>
@@ -99,14 +99,15 @@
       <div class="section-heading compact"><div><p class="eyebrow">06 / SPOT ORDER BOOK</p><h2>Depth & spread</h2><p id="book-source">Waiting for exchange depth…</p></div><span class="badge green">LIVE SNAPSHOT</span></div>
       <div id="depth-summary" class="depth-summary"><p class="placeholder">Waiting for order book data…</p></div>
       <div class="ladder-grid"><div><h3>BID LADDER <small>buyers</small></h3><div id="bid-ladder" class="ladder-list"></div></div><div><h3>ASK LADDER <small>sellers</small></h3><div id="ask-ladder" class="ladder-list"></div></div></div>
-      <p class="muted-detail">Displayed depth covers up to 100 resting spot price levels on each side. Orders can be cancelled without trading.</p>
+      <p class="muted-detail">This near-price ladder shows up to 100 Kraken spot levels on each side, for short-term order flow only. Wider verified liquidity is in the adjacent panel.</p>
     </article>
     <article class="context-card cluster-card">
-      <div class="section-heading compact"><div><p class="eyebrow">07 / LIQUIDITY PRICE MAP</p><h2>Where the buy & sell walls are</h2><p>Actual resting order price zones, relative to current spot</p></div><span class="badge">5 BP BANDS</span></div>
+      <div class="section-heading compact"><div><p class="eyebrow">07 / DISTANT LIQUIDITY PRICE MAP</p><h2>Where meaningful buy & sell walls sit</h2><p>Verified resting limit orders 0.5%–5% away from the exchange reference price</p></div><span class="badge">25 BP BANDS</span></div>
       <div id="cluster-coverage" class="cluster-coverage">Waiting for visible price range…</div>
       <div id="cluster-highlights" class="cluster-highlights"><p class="placeholder">Locating largest buy and sell walls…</p></div>
       <div id="cluster-list" class="cluster-list"><p class="placeholder">Calculating resting-order price zones…</p></div>
-      <p class="muted-detail">Green = visible <b>buy limit orders (bids)</b>; red = visible <b>sell limit orders (asks)</b>. Shows up to six strongest 0.05% bands per side within the exchange's available top 100 levels. This is <b>not</b> a liquidation/stop-loss heatmap, and resting orders can disappear.</p>
+      <p class="muted-detail">Live spot liquidity from up to <b>1,000 Bybit levels</b> per side, with a <b>500-level Kraken fallback</b>. Only actual displayed orders 0.5%–5% from that book's own midprice qualify. If an exchange does not expose sufficient distant orders, we explicitly say so. <b>USDT notionals are not exact USD.</b> These are not forced-liquidation or stop-loss orders; walls can vanish.</p>
+      <div class="structure-map"><div class="structure-title"><strong>Potential liquidity sweep targets · 1H / 4H</strong><span>INFERRED FROM SWING HIGHS / LOWS — NOT ORDER WALLS</span></div><div id="structure-targets" class="structure-targets"><p class="placeholder">Scanning wider price structure…</p></div></div>
     </article>
   </section>
 
@@ -145,8 +146,8 @@
     </article>
   </section>
 
-  <footer><div><strong>BTC INTELLIGENCE <span>v0.6.0</span></strong><p>Research software • no brokerage connection • no live trading or Telegram alerts.</p></div><div>Free Render hosting may sleep when inactive. Signal and liquidity history on the free server can reset after redeployment. <b>Not financial advice.</b></div></footer>
+  <footer><div><strong>BTC INTELLIGENCE <span>v0.7.0</span></strong><p>Research software • no brokerage connection • no live trading or Telegram alerts. Strategy unvalidated.</p></div><div>Free Render hosting may sleep when inactive. Signal and liquidity history on the free server can reset after redeployment. <b>Not financial advice.</b></div></footer>
 </main>
-<script src="/static/app.js?v=0.6.0"></script>
+<script src="/static/app.js?v=0.7.0"></script>
 </body>
 </html>

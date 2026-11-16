@@ -78,31 +78,29 @@ function renderDecision(asset,stale){
   const b=asset.bias,t=asset.timing;
   setScore('bias',b,asset.bias_label);
   setScore('timing',t,asset.timing_label);
-  const slow=typeof b==='number'&&Math.abs(b)>=30;
-  const fast=typeof t==='number'&&Math.abs(t)>=30;
-  const agreement=slow&&fast&&Math.sign(b)===Math.sign(t)&&!stale;
-  const passed=[slow,fast,agreement].filter(Boolean).length;
-  $('signal-gates').innerHTML=gate('Slow market bias',slow,slow?b>0?'BULLISH':'BEARISH':'MIXED')
-    +gate('Fast execution timing',fast,fast?t>0?'BULLISH':'BEARISH':'MIXED')
-    +gate('Same direction + current feed',agreement,agreement?'ALIGNED':stale?'STALE':'NO AGREEMENT');
-  $('gate-result').textContent=passed+' / 3';
+  const checks=asset.signal_checks||[];
+  const passed=checks.filter(x=>x.ok).length;
+  $('signal-gates').innerHTML=checks.map(x=>gate(x.label,x.ok&&!stale,stale?'STALE':x.detail)).join('')||'<p class="placeholder">Awaiting completed-candle evaluation.</p>';
+  $('gate-result').textContent=(stale?0:passed)+' / '+checks.length;
+  const confirmed=!stale&&['LONG CANDIDATE','SHORT CANDIDATE'].includes(asset.direction)&&checks.length===6&&passed===6;
   const status=$('signal-status');
   status.className='signal-status';
-  if(agreement){
-    const long=b>0;
+  if(confirmed){
+    const long=asset.direction==='LONG CANDIDATE';
     status.textContent=long?'TEST LONG':'TEST SHORT';
     status.classList.add(long?'long':'short');
-    $('signal-reason').textContent='Both timeframes currently agree on a '+(long?'bullish':'bearish')+' direction. This is a provisional confluence test.';
+    $('signal-reason').textContent=asset.setup_reason;
   }else{
-    status.textContent=stale?'FEED STALE':'WAIT / NO TRADE';
+    const directionalWatch=b>=55&&t>=55?'BULLISH WATCH':b<=-55&&t<=-55?'BEARISH WATCH':'WAIT / NO TRADE';
+    status.textContent=stale?'FEED STALE':directionalWatch;
     status.classList.add('wait');
-    $('signal-reason').textContent=stale?'Last observation is too old. A fresh market check is required.':slow&&!fast?'Regime is directional, but execution timing has not confirmed it.':fast&&!slow?'Execution momentum exists, but the slow market regime does not confirm it.':'The two score thresholds are not aligned. No test trade is generated.';
+    $('signal-reason').textContent=stale?'Last observation is too old. No new paper setup until refreshed.':(asset.setup_reason||'No confirmed price-action entry. Watching only — NO TRADE.');
   }
-  const levels=agreement?asset.levels:null;
+  const levels=confirmed?asset.levels:null;
   for(const id of ['entry','stop','tp1','tp2','tp3']) $(id).textContent=usd(levels?.[id]);
   $('plan-status').textContent=levels?'TEST CANDIDATE':'NO SETUP';
   $('plan-status').className='badge'+(levels?' green':'');
-  $('plan-reason').textContent=levels?'Risk distance uses 15M ATR with a 0.3% price floor. All targets are illustrative.':'Waiting for directional agreement. No entry or targets are inferred without a candidate.';
+  $('plan-reason').textContent=levels?'Stop considers 15M swing extremes plus ATR; 1R / 2R / 3R are indicative, not filled orders.':(asset.setup_reason||'Waiting for all six checks.');
 }
 function renderZones(asset){
   const zones=asset.fvg_by_timeframe?.[selectedFvg] || (selectedFvg==='15m'?asset.fvg:[]) || [];
@@ -114,13 +112,14 @@ function renderZones(asset){
 }
 function renderOrderBook(asset){
   const book=asset.order_book;
-  $('book-source').textContent=book?(asset.market_source||'Spot')+' · up to 100 levels/side · '+shortTime(asset.updated):'Spot depth is unavailable';
+  $('book-source').textContent=book?(asset.market_source||'Spot')+' · nearest 100 levels/side · '+shortTime(asset.updated):'Spot depth is unavailable';
   if(!book){
     $('depth-summary').innerHTML='<p class="placeholder">No verified order-book snapshot from this feed.</p>';
     $('bid-ladder').innerHTML='';$('ask-ladder').innerHTML='';
     $('cluster-coverage').textContent='Visible price range unavailable';
     $('cluster-highlights').innerHTML='';
     $('cluster-list').innerHTML='<p class="placeholder">Liquidity price levels need a valid spot order book.</p>';
+    $('structure-targets').innerHTML='<p class="placeholder">Price-structure targets unavailable.</p>';
     return;
   }
   const buy=Number(book.bid_share)||0;
@@ -132,9 +131,9 @@ function renderOrderBook(asset){
   function ladder(rows,side){return (rows||[]).map(row=>'<div class="ladder-row '+side+'"><span>'+usd(row.price)+'</span><div class="ladder-meter"><i style="width:'+(row.usd/max*100).toFixed(1)+'%"></i></div><b>'+compactUsd(row.usd)+'</b></div>').join('')||'<p class="placeholder">No levels</p>'}
   $('bid-ladder').innerHTML=ladder(book.bids,'bid');
   $('ask-ladder').innerHTML=ladder(book.asks,'ask');
-  const legacy=book.clusters||[];
-  const bids=book.cluster_map?.bids||legacy.filter(x=>x.side==='BID').slice(0,6);
-  const asks=book.cluster_map?.asks||legacy.filter(x=>x.side==='ASK').slice(0,6);
+  const wide=asset.liquidity_map;
+  const bids=wide?.bids||[];
+  const asks=wide?.asks||[];
   const strongest=Math.max(1,...[...bids,...asks].map(x=>Number(x.usd)||0));
   const zonePrice=row=>{
     const low=typeof row.low==='number'?row.low:row.price;
@@ -145,16 +144,21 @@ function renderOrderBook(asset){
     const distance=Number(row.distance_pct);
     return Number.isFinite(distance)?(distance>0?'+':'')+distance.toFixed(2)+'% vs spot':'Distance unavailable';
   };
-  const coverage=book.coverage;
-  $('cluster-coverage').textContent=(coverage?'Visible depth range: '+usd(coverage.low)+' to '+usd(coverage.high)+' · '+coverage.bid_levels+' bid / '+coverage.ask_levels+' ask levels':'Visible exchange depth near current spot only')+(Date.now()-Date.parse(asset.updated)>300000?' · STALE SNAPSHOT':'');
-  const highlight=(wall,side)=>'<div class="wall-highlight '+side+'"><small>'+(side==='bid'?'LARGEST VISIBLE BUY WALL':'LARGEST VISIBLE SELL WALL')+'</small><strong>'+(wall?zonePrice(wall):'—')+'</strong><span>'+(wall?compactUsd(wall.usd)+' · '+spotDistance(wall):'No verified levels')+'</span></div>';
+  const coverage=wide?.coverage;
+  const notional=value=>(wide?.quote==='USDT'?compactUsd(value).replace('$','')+' USDT':compactUsd(value));
+  $('cluster-coverage').textContent=(wide?wide.source+' · '+(wide.quote==='USDT'?'BTC/ETH quoted in USDT':'USD market')+' · book mid '+usd(wide.reference_price)+' · visible '+usd(coverage.low)+' to '+usd(coverage.high)+' · '+coverage.bid_levels+' bid / '+coverage.ask_levels+' ask levels':'No verified distant book available')+(Date.now()-Date.parse(asset.updated)>300000?' · STALE SNAPSHOT':'');
+  const wallStrength=row=>typeof row?.relative_strength==='number'?row.relative_strength.toFixed(1)+'× typical depth band':'Relative strength unavailable';
+  const highlight=(wall,side)=>'<div class="wall-highlight '+side+'"><small>'+(side==='bid'?'LARGEST OBSERVED BUY BAND':'LARGEST OBSERVED SELL BAND')+' · 0.5–5%</small><strong>'+(wall?zonePrice(wall):'NOT IN VISIBLE DEPTH')+'</strong><span>'+(wall?notional(wall.usd)+' · '+spotDistance(wall)+' · '+wallStrength(wall):'No orders verified at this distance')+'</span></div>';
   $('cluster-highlights').innerHTML=highlight(bids[0],'bid')+highlight(asks[0],'ask');
   const wallRow=(row,side,largest)=>{
     const width=Math.min(100,Math.max(0,(Number(row.usd)||0)/strongest*100));
-    return '<div class="wall-zone '+side+'"><div class="wall-zone-top"><div><strong>'+zonePrice(row)+'</strong><small>'+spotDistance(row)+(row.levels?' · '+htmlSafe(row.levels)+' price levels':'')+(row===largest?' · STRONGEST '+(side==='bid'?'BUY':'SELL'):'')+'</small></div><b>'+compactUsd(row.usd)+'</b></div><div class="wall-zone-bar"><i style="width:'+width.toFixed(1)+'%"></i></div></div>';
+    return '<div class="wall-zone '+side+'"><div class="wall-zone-top"><div><strong>'+zonePrice(row)+'</strong><small>'+spotDistance(row)+(row.levels?' · '+htmlSafe(row.levels)+' price levels':'')+' · '+wallStrength(row)+(row===largest?' · LARGEST '+(side==='bid'?'BUY':'SELL'):'')+'</small></div><b>'+notional(row.usd)+'</b></div><div class="wall-zone-bar"><i style="width:'+width.toFixed(1)+'%"></i></div></div>';
   };
-  const wallSection=(rows,side)=>'<div class="wall-section-label '+side+'">'+(side==='ask'?'▲ SELL LIMIT ORDERS (ASKS)':'▼ BUY LIMIT ORDERS (BIDS)')+'<span>TOP '+rows.length+' BY VISIBLE USD</span></div>'+(rows.length?[...rows].sort((a,b)=>b.price-a.price).map(row=>wallRow(row,side,rows[0])).join(''):'<p class="placeholder">No '+side+' liquidity in this snapshot.</p>');
-  $('cluster-list').innerHTML=wallSection(asks,'ask')+'<div class="spot-price-anchor"><span>● CURRENT SPOT PRICE</span><strong>'+usd(asset.price)+'</strong></div>'+wallSection(bids,'bid');
+  const wallSection=(rows,side)=>'<div class="wall-section-label '+side+'">'+(side==='ask'?'▲ SELL LIMIT ORDERS (ASKS)':'▼ BUY LIMIT ORDERS (BIDS)')+'<span>TOP '+rows.length+' DISTANT BANDS</span></div>'+(rows.length?[...rows].sort((a,b)=>b.price-a.price).map(row=>wallRow(row,side,rows[0])).join(''):'<p class="wall-unavailable">No verified '+(side==='bid'?'buy':'sell')+' wall 0.5%–5% from this book reference. The available book may not reach that far; no levels are extrapolated.</p>');
+  $('cluster-list').innerHTML=wallSection(asks,'ask')+'<div class="spot-price-anchor"><span>● '+(wide?'EXCHANGE BOOK MIDPRICE':'SPOT REFERENCE')+'</span><strong>'+usd(wide?.reference_price??asset.price)+'</strong></div>'+wallSection(bids,'bid');
+  const targets=asset.structure_targets||{};
+  const structureSide=(items,label,side)=>'<div class="structure-side"><h4 class="'+side+'">'+label+'</h4>'+(items?.length?items.map(row=>'<div class="structure-row"><strong>'+zonePrice(row)+'</strong><span>'+(row.distance_pct>0?'+':'')+htmlSafe(row.distance_pct)+'% · '+htmlSafe(row.touches)+' swing touch'+(row.touches===1?'':'es')+' · '+htmlSafe(row.timeframes.join('/'))+'</span></div>').join(''):'<p class="placeholder">No repeated swing level in the scan.</p>')+'</div>';
+  $('structure-targets').innerHTML=structureSide(targets.above,'ABOVE PRICE · PRIOR HIGHS','ask')+structureSide(targets.below,'BELOW PRICE · PRIOR LOWS','bid');
 }
 function renderLiquidity(asset,stale){
   const observation=current?.liquidity_monitor?.[selected];
@@ -201,7 +205,7 @@ function signalLogRows(){
 function renderSignalLog(){
   $('signal-log-symbol').textContent=selected.startsWith('BTC')?'BTC':'ETH';
   const rows=signalLogRows();
-  $('signal-log').innerHTML=rows.length?rows.map(row=>'<tr><td>'+utcTime(row.ts)+'</td><td><span class="direction '+(row.side==='LONG'?'bull':'bear')+'">'+htmlSafe(row.side)+'</span></td><td>'+usd(row.entry)+'</td><td>'+usd(row.tp1)+'</td><td>'+usd(row.tp2)+'</td><td>'+usd(row.tp3)+'</td><td>'+usd(row.stop)+'</td><td><span class="outcome '+(row.status.includes('SL')?'bad':row.status.includes('TP')?'good':'')+'">'+htmlSafe(row.status)+'</span></td></tr>').join(''):'<tr><td colspan="8" class="no-signals">No test candidates issued yet. New entries appear when both score gates agree.</td></tr>';
+  $('signal-log').innerHTML=rows.length?rows.map(row=>'<tr><td>'+utcTime(row.ts)+'</td><td><span class="direction '+(row.side==='LONG'?'bull':'bear')+'">'+htmlSafe(row.side)+'</span><small class="strategy-version">'+htmlSafe(row.strategy_version||'LEGACY')+'</small></td><td>'+usd(row.entry)+'</td><td>'+usd(row.tp1)+'</td><td>'+usd(row.tp2)+'</td><td>'+usd(row.tp3)+'</td><td>'+usd(row.stop)+'</td><td><span class="outcome '+(row.status.includes('SL')?'bad':row.status.includes('TP')?'good':'')+'">'+htmlSafe(row.status)+'</span></td></tr>').join(''):'<tr><td colspan="8" class="no-signals">No six-gate test candidate issued yet. An aligned trend alone does not count as a trade.</td></tr>';
 }
 function renderHistory(){
   const rows=current?.decision_log?.[selected] || [];

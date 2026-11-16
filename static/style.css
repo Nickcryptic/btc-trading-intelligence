@@ -209,6 +209,18 @@ h1 em{font-style:normal;color:var(--mint)}
 .spot-price-anchor{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:13px 12px;background:#1a3346;border:1px dashed #5c91af;border-radius:8px;margin:5px 0;color:#dff3fc}
 .spot-price-anchor span{font-size:10px;font-weight:900;letter-spacing:.8px;color:#9cc4df}
 .spot-price-anchor strong{font:800 16px 'Space Grotesk',sans-serif;white-space:nowrap}
+.wall-unavailable{color:#d9bb91;background:#302619;border:1px solid #6c502d;border-radius:8px;padding:14px;line-height:1.6;font-size:11px;margin:0}
+.structure-map{margin-top:23px;border-top:1px solid #345069;padding-top:18px}
+.structure-title strong{display:block;color:#d7e7f4;font:700 13px 'Space Grotesk',sans-serif}
+.structure-title span{display:block;margin-top:5px;color:#c5a57c;font-size:9px;font-weight:900;letter-spacing:.6px}
+.structure-targets{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:13px}
+.structure-side{border:1px solid #3a4b62;border-radius:9px;background:#132235;padding:10px;min-width:0}
+.structure-side h4{font-size:9px;letter-spacing:.45px;color:#b0c5d7;margin:0 0 9px}
+.structure-side h4.ask{color:#ff9bb2}.structure-side h4.bid{color:#58e2bf}
+.structure-row{border-top:1px solid #31465b;padding:8px 0}
+.structure-row strong{display:block;color:#eff6fc;font:700 12px 'Space Grotesk',sans-serif;overflow-wrap:anywhere}
+.structure-row span{display:block;color:#96abc0;font-size:9px;margin-top:4px;line-height:1.3}
+.strategy-version{display:block;margin-top:4px;font-size:9px;color:#859db2;letter-spacing:.3px}
 .liquidity-intelligence{display:grid;grid-template-columns:minmax(0,1.16fr) minmax(0,1fr);gap:17px;margin-bottom:18px}
 .liquidity-evaluation{border:1px solid #28645c;border-radius:15px;padding:25px 28px;background:linear-gradient(140deg,#102d37,#0c1c2e 72%);box-shadow:0 12px 36px #020a1424;min-width:0}
 .liquidity-evaluation .section-heading{align-items:start}
@@ -267,4 +279,5 @@ footer b{color:#b1bdc8}
 @media(max-width:430px){.topbar .live-badge{display:none}}
 @media(max-width:850px){.liquidity-intelligence{grid-template-columns:1fr}}
 @media(max-width:600px){.liquidity-evaluation{padding:20px 15px}.liquidity-evaluation .section-heading{flex-wrap:wrap}.liquidity-state{font-size:26px}.liquidity-metrics{gap:8px}.liquidity-metrics>div{padding:12px 10px}.liquidity-metrics strong{font-size:22px}.liquidity-sequence-head,.liquidity-sequence-row{grid-template-columns:43px 61px 65px minmax(0,1fr);gap:5px}.liquidity-sequence-head{font-size:8px}.liquidity-sequence-row{font-size:10px}.liq-label{font-size:8px;padding:6px 3px}}
+@media(max-width:480px){.structure-targets{grid-template-columns:1fr}.wall-zone-top b{font-size:11px}.wall-highlight strong{font-size:11px}.signal-status.wait{font-size:clamp(27px,7vw,36px)}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
