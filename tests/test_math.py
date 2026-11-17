@@ -2,12 +2,14 @@ import tempfile
 import sqlite3
 import asyncio
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+import httpx
 
 import app
 import math
 
-from app import ema, rsi, fvg_zones, score_label, kraken_result, parse_kraken_ohlc, parse_stablecoin_growth, halving_context, calc_asset, order_book_snapshot, observed_signal_status, recent_tape_snapshot, liquidity_observation, wide_liquidity_snapshot, parse_bybit_wide_book, build_broad_liquidity, professional_decision, structure_liquidity_targets, replay_recent_candles
+from app import ema, rsi, fvg_zones, score_label, kraken_result, parse_kraken_ohlc, parse_stablecoin_growth, halving_context, calc_asset, order_book_snapshot, observed_signal_status, reconcile_signal, recent_tape_snapshot, liquidity_observation, wide_liquidity_snapshot, parse_bybit_wide_book, build_broad_liquidity, professional_decision, structure_liquidity_targets, replay_recent_candles
 
 def test_ema_constant():
     assert ema([10]*30,21)==10
@@ -80,6 +82,12 @@ def test_weak_confluence_is_no_longer_a_trade_signal():
     assert set(result['fvg_by_timeframe'])=={'15m','1h','1d'}
     assert all(isinstance(result['fvg_by_timeframe'][tf],list) for tf in ('15m','1h','1d'))
     assert result['order_book']['bid_share']>50
+    by_name={indicator['name']:indicator for indicator in result['indicators']}
+    assert by_name['200D Moving Average']['source_as_of'].endswith('+00:00')
+    assert by_name['15M RSI']['source_as_of'].endswith('+00:00')
+    assert by_name['15M RSI']['fetched_at']
+    assert by_name['Order Book Imbalance']['source_as_of'] is None
+    assert by_name['Funding Rate']['fetched_at'] is None
 
     # A bullish regime with bearish fast timing must produce no trade.
     negative_trades=[{'qty':'10','isBuyerMaker':True}]
@@ -126,6 +134,8 @@ def test_bybit_depth_validation_and_fallback():
 def test_full_kraken_refresh_keeps_optional_bybit_failure_nonfatal():
     sources={15:trend_candles(step=4),60:trend_candles(step=9),
              240:trend_candles(step=14),1440:trend_candles(step=17)}
+    sources[1]=[{'ts':i*60000,'open':100,'high':110,'low':90,'close':100,'volume':1}
+                for i in range(260)]
     price=sources[15][-2]['close']
     depth={'bids':[[str(price-.1-i*6),'1',0] for i in range(500)],
            'asks':[[str(price+.1+i*6),'1',0] for i in range(500)]}
@@ -152,6 +162,8 @@ def test_full_kraken_refresh_keeps_optional_bybit_failure_nonfatal():
         app.fetch_json=fake_fetch
         available=asyncio.run(app.fetch_asset_kraken(None,'BTCUSDT'))
         assert available['liquidity_map']['source'].startswith('Bybit')
+        assert len(available['_observation_candles'])==259
+        assert available['observation_source']=='Kraken spot · completed 1M OHLC'
         assert available['liquidity_map']['coverage']['bid_levels']==1000
         assert available['liquidity_map']['bids']
         assert available['order_book']['coverage']['bid_levels']==100
@@ -342,6 +354,7 @@ def test_liquidity_map_keeps_both_sides_with_actual_price_ranges():
 
 
 def test_signal_milestones_from_polled_prices():
+    # Legacy helper remains for compatibility; the journal no longer uses it.
     long={'status':'TRACKING','side':'LONG','stop':95,'tp1':105,'tp2':110,'tp3':115}
     assert observed_signal_status(long,104)=='TRACKING'
     assert observed_signal_status(long,105)=='TP1 SEEN'
@@ -350,6 +363,68 @@ def test_signal_milestones_from_polled_prices():
     short={'status':'TRACKING','side':'SHORT','stop':105,'tp1':95,'tp2':90,'tp3':85}
     assert observed_signal_status(short,94)=='TP1 SEEN'
     assert observed_signal_status(short,106)=='SL SEEN'
+
+
+def test_one_minute_candles_observe_short_stop_after_poll_missed_it():
+    issued='2026-11-17T19:31:22+00:00'
+    start=(int(datetime.fromisoformat(issued).timestamp()//60)+1)*60000
+    short={'ts':issued,'status':'TRACKING','side':'SHORT','entry':1784.69,
+           'stop':1805.77,'tp1':1770,'tp2':1750,'tp3':1730}
+    below_stop=reconcile_signal(short,[{'ts':start,'high':1804,'low':1790}])
+    assert below_stop['status']=='TRACKING'  # WATCH SL != journal stop.
+    seen=reconcile_signal(short,[{'ts':start,'high':1806,'low':1785},
+                                 {'ts':start+60000,'high':1800,'low':1785}])
+    assert seen['status']=='SL SEEN'
+    assert seen['observed_at']==datetime.fromtimestamp((start+60000)/1000,timezone.utc).isoformat()
+    assert '1M OHLC' in seen['observation_source']
+
+
+def test_candle_replay_respects_targets_stop_order_and_ambiguous_bar():
+    issued='2026-11-17T19:31:22+00:00'
+    first=(int(datetime.fromisoformat(issued).timestamp()//60)+1)*60000
+    long={'ts':issued,'side':'LONG','status':'TRACKING','entry':100,
+          'stop':95,'tp1':105,'tp2':110,'tp3':115}
+    first_target=reconcile_signal(long,[{'ts':first,'high':106,'low':99}])
+    assert first_target['status']=='TP1 SEEN'
+    after_stop=reconcile_signal(first_target,[{'ts':first+60000,'high':104,'low':94}])
+    assert after_stop['status']=='SL AFTER TP1'
+    ambiguous=reconcile_signal(long,[{'ts':first,'high':106,'low':94}])
+    assert ambiguous['status']=='AMBIGUOUS SL/TP'
+    assert reconcile_signal(long,[{'ts':first,'high':115,'low':98}])['status']=='TP3 SEEN'
+
+
+def test_missing_history_displays_unverified_not_false_tracking():
+    issued='2026-11-17T19:31:22+00:00'
+    first=(int(datetime.fromisoformat(issued).timestamp()//60)+1)*60000
+    short={'ts':issued,'side':'SHORT','status':'TRACKING','entry':100,
+           'stop':105,'tp1':95,'tp2':90,'tp3':85}
+    history=reconcile_signal(short,[{'ts':first+600000,'high':103,'low':99}])
+    assert history['status']=='TRACKING' and history['coverage']=='GAP'
+    later_stop=reconcile_signal(short,[{'ts':first+600000,'high':106,'low':98}])
+    assert later_stop['status']=='SL SEEN' and later_stop['coverage']=='GAP'
+    assert reconcile_signal(short,None)['coverage']=='FEED UNAVAILABLE'
+    assert reconcile_signal({**history,'coverage':'GAP'},None)['coverage']=='GAP'
+
+
+def test_browser_recovery_endpoint_rechecks_older_rows_read_only():
+    issued='2026-11-17T19:31:22+00:00'
+    first=(int(datetime.fromisoformat(issued).timestamp()//60)+1)*60000
+    row={'ts':issued,'side':'SHORT','status':'TRACKING','entry':1784.69,
+         'stop':1805.77,'tp1':1770,'tp2':1750,'tp3':1730}
+    old=app.STATE['observation_candles'].get('ETHUSDT')
+    app.STATE['observation_candles']['ETHUSDT']=[{'ts':first,'high':1806,'low':1790}]
+    async def request():
+        transport=httpx.ASGITransport(app=app.app)
+        async with httpx.AsyncClient(transport=transport,base_url='http://test') as client:
+            return await client.post('/api/reconcile-cached-signals',json={'symbol':'ETHUSDT','rows':[row]})
+    try:
+        result=asyncio.run(request())
+        assert result.status_code==200
+        assert result.json()['rows'][0]['status']=='SL SEEN'
+        assert result.json()['rows'][0]['history_source']=='BROWSER RECOVERED'
+    finally:
+        if old is None:app.STATE['observation_candles'].pop('ETHUSDT',None)
+        else:app.STATE['observation_candles']['ETHUSDT']=old
 
 
 def test_signal_journal_de_duplicates_immediate_candidates():
@@ -364,13 +439,15 @@ def test_signal_journal_de_duplicates_immediate_candidates():
             first=app.record_signal_log('BTCUSDT',asset,'NO TRADE')
             assert len(first)==1
             assert first[0]['status']=='TRACKING'
-            assert first[0]['strategy_version']=='0.8.0'
+            assert first[0]['strategy_version']=='0.8.1'
             assert first[0]['model_score']==74
             assert first[0]['candle_ts']==1700000000000
             second=app.record_signal_log('BTCUSDT',asset,'LONG CANDIDATE')
             assert len(second)==1
-            asset['price']=106
-            reached=app.record_signal_log('BTCUSDT',asset,'LONG CANDIDATE')
+            issued=datetime.fromisoformat(first[0]['ts'])
+            first_bar=(int(issued.timestamp()//60)+1)*60000
+            candles=[{'ts':first_bar,'high':106,'low':99}]
+            reached=app.record_signal_log('BTCUSDT',asset,'LONG CANDIDATE',candles)
             assert reached[0]['status']=='TP1 SEEN'
             assert len(reached)==1
         finally:

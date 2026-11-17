@@ -128,6 +128,9 @@ h1 em{font-style:normal;color:var(--mint)}
 .indicator-row:last-child{border-bottom:0}
 .indicator-name{display:block;font-size:12px;font-weight:800;color:#e1ebf4}
 .indicator-source{display:block;font-size:10px;color:#6e8ca3;margin-top:5px;line-height:1.3}
+.indicator-stamp{display:block;font-size:9px;color:#86a6b9;margin-top:4px;line-height:1.35;font-variant-numeric:tabular-nums}
+.outcome-detail,.outcome-warning{display:block;font-family:'DM Sans',sans-serif;font-size:9px;line-height:1.45;margin-top:5px;max-width:200px;white-space:normal;color:#8da8be}
+.outcome-warning{color:#f2bd73;margin-top:2px}
 .indicator-value{font:700 13px 'Space Grotesk',sans-serif;color:#d2e0ed;text-align:right;word-break:break-word}
 .signal-pill{font-size:9px;font-weight:900;letter-spacing:.7px;padding:7px 8px;border-radius:6px;white-space:nowrap;min-width:65px;text-align:center}
 .signal-pill.buy{color:#3ce8bc;background:#0c4036}

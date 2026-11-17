@@ -16,7 +16,9 @@ const asset = {
     asks:[{price:102,low:102,high:102.2,usd:8000,levels:4,distance_pct:2.1,relative_strength:1.7,side:'ASK'}]},
   structure_targets:{above:[{price:103.1,low:103,high:103.2,distance_pct:3.1,touches:3,timeframes:['1H','4H']}],below:[]}
 };
-const ctx = vm.createContext({document,asset,Date});
+const storage = new Map();
+const localStorage = {getItem:key=>storage.get(key)||null,setItem:(key,value)=>storage.set(key,value)};
+const ctx = vm.createContext({document,asset,Date,localStorage});
 vm.runInContext(source+'\nrenderOrderBook(asset);',ctx);
 assert.match(elements['cluster-highlights'].innerHTML,/LARGEST OBSERVED BUY BAND/);
 assert.match(elements['cluster-highlights'].innerHTML,/LARGEST OBSERVED SELL BAND/);
@@ -50,4 +52,18 @@ assert.equal(elements['plan-status'].textContent,'PAPER CANDIDATE');
 vm.runInContext('renderDecision(asset,true)',ctx);
 assert.equal(elements['signal-status'].textContent,'FEED STALE');
 assert.equal(elements['entry'].textContent,'—');
+vm.runInContext(`document.getElementById('slow-indicators');renderIndicators({indicators:[
+  {name:'200D Moving Average',source:'Kraken spot',value:'$70,000',signal:'BUY',
+   fetched_at:'2026-11-17T19:34:21Z',source_as_of:'2026-11-17T00:00:00Z'}]})`,ctx);
+assert.match(elements['slow-indicators'].innerHTML,/Pulled:.*19:34:21/);
+assert.match(elements['slow-indicators'].innerHTML,/Source as of:.*00:00:00/);
+vm.runInContext(`current={signal_log:{BTCUSDT:[{ts:'2026-11-17T19:31:22Z',side:'SHORT',
+ entry:100,stop:105,tp1:95,tp2:90,tp3:85,status:'SL SEEN',
+ observed_at:'2026-11-17T19:33:00Z',coverage:'COMPLETE (EXCEPT ISSUANCE MINUTE)',
+ observation_source:'Kraken spot · completed 1M OHLC'}]}};renderSignalLog()`,ctx);
+assert.match(elements['signal-log'].innerHTML,/SL SEEN/);
+assert.match(elements['signal-log'].innerHTML,/Observed in 1M bar ending/);
+vm.runInContext(`current.signal_log.BTCUSDT[0].status='TRACKING';
+current.signal_log.BTCUSDT[0].coverage='GAP';renderSignalLog()`,ctx);
+assert.match(elements['signal-log'].innerHTML,/UNVERIFIED HISTORY/);
 console.log('Distant liquidity, conditional watches, weighted paper signals, and stale-feed guards render.');

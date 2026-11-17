@@ -15,7 +15,7 @@ from base64 import b64decode
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).parent
@@ -23,8 +23,8 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.8.0'
-STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'version': STRATEGY_VERSION}
+STRATEGY_VERSION = '0.8.1'
+STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
 
@@ -43,6 +43,10 @@ def init_db():
             db.execute('ALTER TABLE signals ADD COLUMN model_score INTEGER')
         if 'setup_type' not in columns:
             db.execute('ALTER TABLE signals ADD COLUMN setup_type TEXT')
+        for column,kind in (('checked_until_ms','INTEGER'),('observed_at','TEXT'),
+                            ('observation_source','TEXT'),('coverage','TEXT'),('verification_note','TEXT')):
+            if column not in columns:
+                db.execute(f'ALTER TABLE signals ADD COLUMN {column} {kind}')
         db.execute('CREATE TABLE IF NOT EXISTS wintermute (id INTEGER PRIMARY KEY, ts TEXT, signal TEXT, note TEXT)')
 
 
@@ -339,7 +343,7 @@ def liquidity_observation(asset, previous=None):
 
 
 def observed_signal_status(row, price):
-    """Update only from observed poll prices; never claim that a limit order filled."""
+    """Legacy spot-sample helper, kept for compatibility; journal uses 1M OHLC."""
     old=row['status']
     if old in ('SL SEEN','SL AFTER TP1','SL AFTER TP2','TP3 SEEN','EXPIRED / UNRESOLVED'):
         return old
@@ -357,18 +361,100 @@ def observed_signal_status(row, price):
     return old
 
 
-def record_signal_log(symbol, asset, previous_direction):
+TERMINAL_OBSERVATIONS = {'SL SEEN', 'SL AFTER TP1', 'SL AFTER TP2', 'TP3 SEEN',
+                         'AMBIGUOUS SL/TP'}
+
+
+def reconcile_signal(row, candles, source='Exchange spot · 1M OHLC'):
+    """Replay *completed* one-minute bar extremes in time order, with honest gaps.
+
+    The issuance minute is excluded when the paper signal arrived mid-bar: its
+    earlier high/low could have occurred before the signal existed. This is a
+    price-level observation, not an order fill or a provably ordered trade tape.
+    """
+    result=dict(row)
+    if result['status'] in TERMINAL_OBSERVATIONS:
+        return result
+    try:
+        issued=datetime.fromisoformat(result['ts'].replace('Z','+00:00'))
+        if issued.tzinfo is None:
+            issued=issued.replace(tzinfo=timezone.utc)
+        issued_ms=int(issued.timestamp()*1000)
+    except (TypeError,ValueError,OverflowError):
+        result.update(coverage='GAP',verification_note='Invalid signal timestamp; result cannot be reconstructed.')
+        return result
+    first_full_minute=((issued_ms+59999)//60000)*60000
+    cursor=max(first_full_minute,int(result.get('checked_until_ms') or first_full_minute))
+    gap=result.get('coverage')=='GAP'
+    status='TRACKING' if result['status']=='EXPIRED / UNRESOLVED' else result['status']
+    if not candles:
+        result.update(coverage='GAP' if gap else 'FEED UNAVAILABLE',
+                      verification_note='1-minute candles unavailable; results are not verified.')
+        return result
+    bars=sorted((c for c in candles if isinstance(c.get('ts'),int)),key=lambda c:c['ts'])
+    if not bars:
+        result.update(coverage='FEED UNAVAILABLE',verification_note='No completed 1-minute candles available.')
+        return result
+    if cursor<bars[0]['ts']:
+        gap=True
+        cursor=bars[0]['ts']
+    if not result.get('checked_until_ms') and not gap:
+        # Legacy TP1/TP2 sampled milestones can be replayed accurately only
+        # when the full post-issuance minute sequence is still available.
+        status='TRACKING'
+    for candle in bars:
+        start=candle['ts']
+        if start<cursor:
+            continue
+        if start>cursor:
+            gap=True
+        high,low=candle['high'],candle['low']
+        long=result['side']=='LONG'
+        stop_hit=low<=result['stop'] if long else high>=result['stop']
+        targets=[i for i in (1,2,3) if (high>=result[f'tp{i}'] if long else low<=result[f'tp{i}'])]
+        reached=max(targets,default=0)
+        known=int(status[2]) if status.startswith('TP') and status[2].isdigit() else 0
+        next_status=status
+        if stop_hit and reached>known:
+            next_status='AMBIGUOUS SL/TP'
+        elif stop_hit:
+            next_status='SL AFTER TP2' if known>=2 else 'SL AFTER TP1' if known>=1 else 'SL SEEN'
+        elif reached>known:
+            next_status=f'TP{reached} SEEN'
+        cursor=start+60000
+        if next_status!=status:
+            status=next_status
+            result.update(observed_at=datetime.fromtimestamp(cursor/1000,timezone.utc).isoformat(),
+                          observation_source=source)
+        if status in TERMINAL_OBSERVATIONS:
+            break
+    if cursor<bars[-1]['ts']+60000 and status not in TERMINAL_OBSERVATIONS:
+        gap=True
+    result['status']=status
+    result['checked_until_ms']=cursor
+    result['coverage']='GAP' if gap else 'COMPLETE (EXCEPT ISSUANCE MINUTE)'
+    note='Completed 1-minute high/low; candle close time shown, not exact touch or execution time.'
+    if issued_ms%60000:
+        note+=' Partial issuance minute excluded.'
+    if gap:
+        note+=' Earlier or intermediate candle history missing: event ordering may be incomplete.'
+    result['verification_note']=note
+    return result
+
+
+def record_signal_log(symbol, asset, previous_direction, candles=None):
     """Only journal actual paper candidates, at most once per side per hour."""
     now=datetime.now(timezone.utc)
     with sqlite3.connect(DB_PATH) as db:
         db.row_factory=sqlite3.Row
         existing=list(db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 50',(symbol,)))
         for row in existing:
-            next_status=observed_signal_status(row,asset['price'])
-            if next_status=='TRACKING' and (now-datetime.fromisoformat(row['ts'])).total_seconds()>12*3600:
-                next_status='EXPIRED / UNRESOLVED'
-            if next_status!=row['status']:
-                db.execute('UPDATE signals SET status=? WHERE id=?',(next_status,row['id']))
+            observed=reconcile_signal(row,candles,asset.get('observation_source','Exchange spot · 1M OHLC'))
+            db.execute('''UPDATE signals SET status=?,checked_until_ms=?,observed_at=?,
+                          observation_source=?,coverage=?,verification_note=? WHERE id=?''',
+                       (observed['status'],observed.get('checked_until_ms'),observed.get('observed_at'),
+                        observed.get('observation_source'),observed.get('coverage'),
+                        observed.get('verification_note'),row['id']))
         direction=asset['direction']
         levels=asset['levels']
         if levels and direction in ('LONG CANDIDATE','SHORT CANDIDATE'):
@@ -465,11 +551,13 @@ async def fetch_macro(client):
                 LOG.warning('Fear & Greed response not valid')
         else:
             current[name]=result
+        if name in current and current[name] is not previous.get(name):
+            current[name]['fetched_at']=datetime.now(timezone.utc).isoformat()
     MACRO_CACHE.update({'expires':time.monotonic()+600,'value':current})
     return current
 
 
-def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spot_source='Binance spot', market_pair=None, macro=None):
+def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spot_source='Binance spot', market_pair=None, macro=None, fetched_at=None):
     macro=macro or {}
     c15=[x['close'] for x in k15]; c1=[x['close'] for x in k1h]; c4=[x['close'] for x in k4h]; cd=[x['close'] for x in kd]
     price=float(ticker['lastPrice'])
@@ -530,6 +618,45 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
     if halving:
         indicators.append({'name':'Bitcoin Halving Cycle','value':f'{halving["blocks_remaining"]:,} blocks left',
                            'signal':'NEUTRAL','source':halving['source']+' · context only'})
+    # A candle timestamp is its OPEN: the value is only final at the close.
+    # Snapshot-only feeds have a retrieval time but no trustworthy source clock.
+    fetched_at=fetched_at or datetime.now(timezone.utc).isoformat()
+    closed_candle_times={
+        'daily':datetime.fromtimestamp((kd[-2]['ts']+86400000)/1000,timezone.utc).isoformat(),
+        '4h':datetime.fromtimestamp((k4h[-2]['ts']+14400000)/1000,timezone.utc).isoformat(),
+        '1h':datetime.fromtimestamp((k1h[-2]['ts']+3600000)/1000,timezone.utc).isoformat(),
+        '15m':datetime.fromtimestamp((k15[-2]['ts']+900000)/1000,timezone.utc).isoformat(),
+    }
+    timeframe_names={
+        '200D Moving Average':'daily','50D Moving Average':'daily','4H Trend':'4h',
+        '1H Momentum':'1h','Support / Resistance':'1h','15M Momentum':'15m',
+        '15M RSI':'15m','Fair Value Gaps':'15m',
+    }
+    macro_names={'Fear & Greed':'fear_greed','Stablecoin Supply (30D)':'stablecoins',
+                 'Bitcoin Halving Cycle':'halving'}
+    valid_trade_times=[]
+    for trade in trades:
+        try:
+            ts=float(trade['ts'])
+            if math.isfinite(ts):
+                valid_trade_times.append(ts/1000 if ts>1e11 else ts)
+        except (KeyError,TypeError,ValueError):
+            pass
+    for indicator in indicators:
+        name=indicator['name']
+        macro_reading=macro.get(macro_names[name]) if name in macro_names else None
+        # Unavailable readings never receive a made-up freshness timestamp.
+        indicator['fetched_at']=(macro_reading.get('fetched_at') if macro_reading else fetched_at)
+        if name in ('Funding Rate','Open Interest') and indicator['signal']=='UNAVAILABLE':
+            indicator['fetched_at']=None
+        if name in timeframe_names:
+            indicator['source_as_of']=closed_candle_times[timeframe_names[name]]
+        elif macro_reading and macro_reading.get('timestamp'):
+            indicator['source_as_of']=datetime.fromtimestamp(macro_reading['timestamp'],timezone.utc).isoformat()
+        elif name=='Recent Trade Delta (CVD proxy)' and valid_trade_times:
+            indicator['source_as_of']=datetime.fromtimestamp(max(valid_trade_times),timezone.utc).isoformat()
+        else:
+            indicator['source_as_of']=None
     replay=replay_recent_candles(k15,k1h,k4h,kd)
     return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'signal_checks':decision['checks'],'signal_score':decision['signal_score'],'signal_grade':decision['signal_grade'],'signal_candle_ts':decision['signal_candle_ts'],'watch_direction':decision['watch_direction'],'watch_levels':decision['watch_levels'],'trigger_price':decision['trigger_price'],'setup_reason':decision['reason'],'setup_trigger':decision['trigger'],'setup_volume_ratio':decision['volume_ratio'],'model_replay':replay,'structure_targets':structure_targets,'indicators':indicators,'fvg':zones,'fvg_by_timeframe':zones_by_timeframe,'order_book':order_book_snapshot(book,price),'recent_tape':recent_tape_snapshot(trades),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Weighted 1D/4H/1H/15M evidence and explicit safety vetoes evaluated live; no validated profitability or fill guarantee.'}
 
@@ -792,15 +919,19 @@ async def fetch_asset_binance(client,symbol,macro=None):
     fut='https://fapi.binance.com/fapi/v1/'
     queries=[fetch_json(client,base+'klines',{'symbol':symbol,'interval':tf,'limit':limit}) for tf,limit in [('15m',160),('1h',160),('4h',160),('1d',260)]]
     queries += [fetch_json(client,base+'ticker/24hr',{'symbol':symbol}),fetch_json(client,base+'depth',{'symbol':symbol,'limit':1000}),fetch_json(client,base+'trades',{'symbol':symbol,'limit':1000}),fetch_json(client,fut+'premiumIndex',{'symbol':symbol}),fetch_json(client,fut+'openInterest',{'symbol':symbol}),fetch_json(client,'https://api.bybit.com/v5/market/orderbook',{'category':'spot','symbol':symbol,'limit':1000},timeout=5)]
+    queries.append(fetch_json(client,base+'klines',{'symbol':symbol,'interval':'1m','limit':1000}))
     out=await asyncio.gather(*queries,return_exceptions=True)
+    fetched_at=datetime.now(timezone.utc).isoformat()
     if any(isinstance(x,Exception) for x in out[:7]):
         raise RuntimeError('Core market feed unavailable: '+', '.join(str(x)[:80] for x in out[:7] if isinstance(x,Exception)))
     k15,k1,k4,kd=[parse_klines(x) for x in out[:4]]
     funding=None if isinstance(out[7],Exception) else out[7].get('lastFundingRate')
     oi=None if isinstance(out[8],Exception) else float(out[8].get('openInterest',0))
     trades=[{**t,'ts':t.get('time')} for t in out[6]]
-    asset=calc_asset(symbol,k15,k1,k4,kd,out[4],out[5],trades,funding,oi,market_pair=symbol.replace('USDT','/USDT'),macro=macro)
+    asset=calc_asset(symbol,k15,k1,k4,kd,out[4],out[5],trades,funding,oi,market_pair=symbol.replace('USDT','/USDT'),macro=macro,fetched_at=fetched_at)
     asset['liquidity_map']=build_broad_liquidity(out[9],symbol,out[5],asset['price'],'Binance spot · up to 1,000 levels per side')
+    asset['_observation_candles']=parse_klines(out[10])[:-1] if not isinstance(out[10],Exception) else None
+    asset['observation_source']='Binance spot · completed 1M OHLC'
     return asset
 
 
@@ -830,7 +961,9 @@ async def fetch_asset_kraken(client,symbol,macro=None):
                 [('Ticker',{}),('Depth',{'count':500}),('Trades',{'count':1000})]]
     queries.append(fetch_json(client,'https://api.bybit.com/v5/market/orderbook',
                               {'category':'spot','symbol':symbol,'limit':1000},timeout=5))
+    queries.append(fetch_json(client,base+'OHLC',{'pair':pair,'interval':1}))
     responses = await asyncio.gather(*queries,return_exceptions=True)
+    fetched_at=datetime.now(timezone.utc).isoformat()
     if any(isinstance(x,Exception) for x in responses[:7]):
         raise RuntimeError('Kraken market feed unavailable: '+', '.join(str(x)[:80] for x in responses[:7] if isinstance(x,Exception)))
     k15,k1,k4,kd = [parse_kraken_ohlc(kraken_result(x)) for x in responses[:4]]
@@ -843,9 +976,15 @@ async def fetch_asset_kraken(client,symbol,macro=None):
     ticker = {'lastPrice':last_price,'priceChangePercent':change24h}
     trades = [{'price':x[0],'qty':x[1],'ts':x[2],'isBuyerMaker':x[3]=='s'} for x in raw_trades]
     result = calc_asset(symbol,k15,k1,k4,kd,ticker,book,trades,None,None,
-                        spot_source='Kraken spot',market_pair=('BTC/USD' if symbol=='BTCUSDT' else 'ETH/USD'),macro=macro)
+                        spot_source='Kraken spot',market_pair=('BTC/USD' if symbol=='BTCUSDT' else 'ETH/USD'),macro=macro,fetched_at=fetched_at)
     result['liquidity_map']=build_broad_liquidity(responses[7],symbol,book,last_price,
                                                 'Kraken spot · up to 500 levels per side')
+    try:
+        result['_observation_candles']=parse_kraken_ohlc(kraken_result(responses[8]))[:-1]
+    except (TypeError,ValueError,RuntimeError,AttributeError) as exc:
+        LOG.warning('%s 1M candle verification unavailable: %s',symbol,exc)
+        result['_observation_candles']=None
+    result['observation_source']='Kraken spot · completed 1M OHLC'
     result['change_approximate']=True
     result['provider_note']='Kraken USD spot; Binance unavailable on this deployment. No futures funding/OI.'
     return result
@@ -875,9 +1014,11 @@ async def refresh():
                 LOG.warning('%s refresh failed: %s',symbol,result)
             else:
                 previous=STATE['previous_direction'].get(symbol)
+                candles=result.pop('_observation_candles',None)
+                STATE['observation_candles'][symbol]=candles
                 STATE['assets'][symbol]=result
                 STATE['source_errors'].pop(symbol,None)
-                STATE['signal_log'][symbol]=record_signal_log(symbol,result,previous)
+                STATE['signal_log'][symbol]=record_signal_log(symbol,result,previous,candles)
                 STATE['previous_direction'][symbol]=result['direction']
                 liquidity_history=STATE['liquidity_history'].setdefault(symbol,[])
                 observation=liquidity_observation(result,liquidity_history[0] if liquidity_history else None)
@@ -954,10 +1095,48 @@ async def health(): return {'ok':True,'version':STATE['version'],'updated':STATE
 async def state():
     async with LOCK:
         data=json.loads(json.dumps(STATE))
+        data.pop('observation_candles',None)
         for rows in data['liquidity_history'].values():
             for row in rows:
                 row.pop('book_snapshot',None)
         return data
+
+
+@app.post('/api/reconcile-cached-signals')
+async def reconcile_cached_signals(request: Request):
+    """Re-check browser-only paper rows after ephemeral server DB replacement.
+
+    Read-only: browser-provided signals are never inserted in server history.
+    """
+    raw=await request.body()
+    if len(raw)>12000:
+        return JSONResponse({'error':'Request too large'},status_code=413)
+    try:
+        payload=json.loads(raw)
+        symbol=payload['symbol']
+        rows=payload['rows']
+        if symbol not in SYMBOLS or not isinstance(rows,list) or len(rows)>5:
+            raise ValueError('Unsupported symbol or row count')
+        cleaned=[]
+        for row in rows:
+            if row.get('side') not in ('LONG','SHORT') or not isinstance(row.get('ts'),str):
+                raise ValueError('Invalid signal metadata')
+            values={key:float(row[key]) for key in ('entry','stop','tp1','tp2','tp3')}
+            if not all(math.isfinite(value) and value>0 for value in values.values()):
+                raise ValueError('Invalid price levels')
+            cleaned.append({**{key:row.get(key) for key in ('ts','symbol','side','status',
+                            'strategy_version','candle_ts','model_score','setup_type',
+                            'checked_until_ms','observed_at','observation_source',
+                            'coverage','verification_note')},**values})
+        async with LOCK:
+            candles=STATE['observation_candles'].get(symbol)
+            source=STATE['assets'].get(symbol,{}).get('observation_source','Exchange spot · 1M OHLC')
+        results=[reconcile_signal({**row,'status':row['status'] or 'TRACKING'},candles,source) for row in cleaned]
+        for row in results:
+            row['history_source']='BROWSER RECOVERED'
+        return {'rows':results}
+    except (KeyError,ValueError,TypeError,OverflowError,AttributeError) as exc:
+        return JSONResponse({'error':str(exc)[:100]},status_code=400)
 
 @app.get('/api/signals')
 async def signals():

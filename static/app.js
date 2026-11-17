@@ -6,6 +6,7 @@ const sideClass = value => value === 'BUY' ? 'buy' : value === 'SELL' ? 'sell' :
 const shortTime = value => value ? new Date(value).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',hour12:false}) : '—';
 const londonTime = value => value ? new Date(value).toLocaleString('en-GB',{timeZone:'Europe/London',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',timeZoneName:'short'}) : 'awaiting feed';
 const utcTime = value => value ? new Date(value).toLocaleString('en-GB',{timeZone:'UTC',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',hour12:false}) : '—';
+const utcStamp = value => value && !Number.isNaN(Date.parse(value)) ? new Date(value).toLocaleString('en-GB',{timeZone:'UTC',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})+' UTC' : 'Not available';
 let selected='BTCUSDT';
 let current=null;
 let selectedFvg='15m';
@@ -40,7 +41,7 @@ const categories = [
 const buildRow = indicator => {
   const value=htmlSafe(indicator.value ?? 'Unavailable');
   const side=htmlSafe(indicator.signal || 'UNAVAILABLE');
-  return '<div class="indicator-row"><div><span class="indicator-name">'+htmlSafe(indicator.name)+'</span><span class="indicator-source">'+htmlSafe(indicator.source)+'</span></div><div class="indicator-value">'+value+'</div><span class="signal-pill '+sideClass(side)+'">'+side+'</span></div>';
+  return '<div class="indicator-row"><div><span class="indicator-name">'+htmlSafe(indicator.name)+'</span><span class="indicator-source">'+htmlSafe(indicator.source)+'</span><span class="indicator-stamp">Pulled: '+htmlSafe(utcStamp(indicator.fetched_at))+'</span><span class="indicator-stamp">Source as of: '+htmlSafe(indicator.source_as_of?utcStamp(indicator.source_as_of):'Not published / snapshot')+'</span></div><div class="indicator-value">'+value+'</div><span class="signal-pill '+sideClass(side)+'">'+side+'</span></div>';
 };
 function renderIndicators(asset){
   const values=asset.indicators || [];
@@ -196,24 +197,66 @@ function renderLiquidity(asset,stale){
     return '<div class="liquidity-sequence-row"><time>'+shortTime(row.ts)+'</time><span>'+bid+'</span><span>'+taker+'</span><b class="liq-label '+tone+'">'+htmlSafe(label)+'</b></div>';
   }).join(''):'<p class="placeholder">The first observation will appear after a successful exchange poll.</p>';
 }
+const journalKey = symbol => 'btc-intel-signal-journal-v04-'+symbol;
+const signalId = row => String(row.ts)+'|'+String(row.entry)+'|'+String(row.side);
+function cachedSignalRows(symbol){
+  let cached=[];
+  try{cached=JSON.parse(localStorage.getItem(journalKey(symbol))||'[]');if(!Array.isArray(cached))cached=[]}catch{cached=[]}
+  return cached;
+}
+function storeSignalRows(symbol,rows){
+  try{localStorage.setItem(journalKey(symbol),JSON.stringify(rows))}catch{/* privacy mode may block storage */}
+}
 function signalLogRows(){
   const fresh=current?.signal_log?.[selected]||[];
-  let cached=[];
-  const key='btc-intel-signal-journal-v04-'+selected;
-  try{cached=JSON.parse(localStorage.getItem(key)||'[]');if(!Array.isArray(cached))cached=[]}catch{cached=[]}
+  const cached=cachedSignalRows(selected);
   const ids=new Set();
   const merged=[...fresh,...cached].filter(row=>{
-    const id=String(row.ts)+'|'+String(row.entry)+'|'+String(row.side);
+    const id=signalId(row);
     if(ids.has(id))return false;
     ids.add(id);return true;
   }).sort((a,b)=>Date.parse(b.ts)-Date.parse(a.ts)).slice(0,5);
-  try{localStorage.setItem(key,JSON.stringify(merged))}catch{/* privacy mode may block storage */}
+  storeSignalRows(selected,merged);
   return merged;
+}
+async function reconcileBrowserHistory(){
+  await Promise.all(['BTCUSDT','ETHUSDT'].map(async symbol=>{
+    const fresh=current?.signal_log?.[symbol]||[];
+    const cached=cachedSignalRows(symbol);
+    const freshIds=new Set(fresh.map(signalId));
+    const orphan=cached.filter(row=>!freshIds.has(signalId(row))).slice(0,5);
+    if(!orphan.length)return;
+    let checked=[];
+    try{
+      const response=await fetch('/api/reconcile-cached-signals',{
+        method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',
+        body:JSON.stringify({symbol,rows:orphan})
+      });
+      if(!response.ok)throw new Error('Verification feed unavailable');
+      checked=(await response.json()).rows||[];
+    }catch{
+      checked=orphan.map(row=>({...row,coverage:'FEED UNAVAILABLE',history_source:'BROWSER RECOVERED',
+        verification_note:'Browser copy has not been verified against current exchange history.'}));
+    }
+    const ids=new Set();
+    const merged=[...fresh,...checked].filter(row=>{
+      const id=signalId(row);if(ids.has(id))return false;ids.add(id);return true;
+    }).sort((a,b)=>Date.parse(b.ts)-Date.parse(a.ts)).slice(0,5);
+    current.signal_log[symbol]=merged;
+    storeSignalRows(symbol,merged);
+  }));
 }
 function renderSignalLog(){
   $('signal-log-symbol').textContent=selected.startsWith('BTC')?'BTC':'ETH';
   const rows=signalLogRows();
-  $('signal-log').innerHTML=rows.length?rows.map(row=>'<tr><td>'+utcTime(row.ts)+'</td><td><span class="direction '+(row.side==='LONG'?'bull':'bear')+'">'+htmlSafe(row.side)+'</span><small class="strategy-version">'+htmlSafe(row.strategy_version||'LEGACY')+(row.model_score!=null?' · '+htmlSafe(row.model_score)+'/100':'')+(row.setup_type?' · '+htmlSafe(row.setup_type):'')+'</small></td><td>'+usd(row.entry)+'</td><td>'+usd(row.tp1)+'</td><td>'+usd(row.tp2)+'</td><td>'+usd(row.tp3)+'</td><td>'+usd(row.stop)+'</td><td><span class="outcome '+(row.status.includes('SL')?'bad':row.status.includes('TP')?'good':'')+'">'+htmlSafe(row.status)+'</span></td></tr>').join(''):'<tr><td colspan="8" class="no-signals">No active paper entry recorded yet. Conditional WATCH plans are not treated as filled trades.</td></tr>';
+  $('signal-log').innerHTML=rows.length?rows.map(row=>{
+    const unverified=row.status==='TRACKING' && ['GAP','FEED UNAVAILABLE'].includes(row.coverage);
+    const label=unverified?'UNVERIFIED HISTORY':row.status;
+    const detail=row.observed_at?'Observed in 1M bar ending '+utcStamp(row.observed_at):
+      row.checked_until_ms?'1M checked to '+utcStamp(new Date(row.checked_until_ms).toISOString()):'Awaiting 1M verification';
+    const provenance=row.history_source?' · browser-recovered entry':'';
+    return '<tr><td>'+utcTime(row.ts)+'</td><td><span class="direction '+(row.side==='LONG'?'bull':'bear')+'">'+htmlSafe(row.side)+'</span><small class="strategy-version">'+htmlSafe(row.strategy_version||'LEGACY')+(row.model_score!=null?' · '+htmlSafe(row.model_score)+'/100':'')+(row.setup_type?' · '+htmlSafe(row.setup_type):'')+'</small></td><td>'+usd(row.entry)+'</td><td>'+usd(row.tp1)+'</td><td>'+usd(row.tp2)+'</td><td>'+usd(row.tp3)+'</td><td>'+usd(row.stop)+'</td><td><span class="outcome '+(label.includes('AMBIGUOUS')?'':label.includes('SL')?'bad':label.includes('TP')?'good':'')+'" title="'+htmlSafe(row.verification_note||'Price observations only, not confirmed order fills')+'">'+htmlSafe(label)+'</span><small class="outcome-detail">'+htmlSafe(detail+provenance)+'</small>'+(row.coverage==='GAP'?'<small class="outcome-warning">Incomplete exchange history</small>':'')+'</td></tr>';
+  }).join(''):'<tr><td colspan="8" class="no-signals">No active paper entry recorded yet. Conditional WATCH plans are not treated as filled trades.</td></tr>';
 }
 function renderHistory(){
   const rows=current?.decision_log?.[selected] || [];
@@ -246,6 +289,7 @@ async function load(){
     const response=await fetch('/api/state',{cache:'no-store'});
     if(!response.ok)throw new Error('Server '+response.status);
     current=await response.json();
+    await reconcileBrowserHistory();
     const asset=current.assets?.[selected];
     $('updated').textContent=shortTime(asset?.updated||current.updated);
     $('updated-mini').textContent='Updated '+londonTime(asset?.updated);
