@@ -81,26 +81,34 @@ function renderDecision(asset,stale){
   const checks=asset.signal_checks||[];
   const passed=checks.filter(x=>x.ok).length;
   $('signal-gates').innerHTML=checks.map(x=>gate(x.label,x.ok&&!stale,stale?'STALE':x.detail)).join('')||'<p class="placeholder">Awaiting completed-candle evaluation.</p>';
-  $('gate-result').textContent=(stale?0:passed)+' / '+checks.length;
-  const confirmed=!stale&&['LONG CANDIDATE','SHORT CANDIDATE'].includes(asset.direction)&&checks.length===6&&passed===6;
+  $('gate-result').textContent=stale?'FEED STALE':(Number(asset.signal_score)||0)+' / 100 · '+htmlSafe(asset.signal_grade||'UNRATED')+' · '+passed+'/'+checks.length+' checks';
+  const confirmed=!stale&&['LONG CANDIDATE','SHORT CANDIDATE'].includes(asset.direction)&&asset.levels;
+  const watching=!stale&&!confirmed&&['LONG','SHORT'].includes(asset.watch_direction)&&asset.watch_levels;
   const status=$('signal-status');
   status.className='signal-status';
   if(confirmed){
     const long=asset.direction==='LONG CANDIDATE';
-    status.textContent=long?'TEST LONG':'TEST SHORT';
+    status.textContent=long?'PAPER LONG':'PAPER SHORT';
     status.classList.add(long?'long':'short');
     $('signal-reason').textContent=asset.setup_reason;
-  }else{
-    const directionalWatch=b>=55&&t>=55?'BULLISH WATCH':b<=-55&&t<=-55?'BEARISH WATCH':'WAIT / NO TRADE';
-    status.textContent=stale?'FEED STALE':directionalWatch;
+  }else if(watching){
+    status.textContent='WATCH '+asset.watch_direction;
     status.classList.add('wait');
-    $('signal-reason').textContent=stale?'Last observation is too old. No new paper setup until refreshed.':(asset.setup_reason||'No confirmed price-action entry. Watching only — NO TRADE.');
+    $('signal-reason').textContent=asset.setup_reason+' This is a conditional plan, NOT an activated signal.';
+  }else{
+    status.textContent=stale?'FEED STALE':'NO QUALIFIED SETUP';
+    status.classList.add('wait');
+    $('signal-reason').textContent=stale?'Last observation is too old. No new paper setup until refreshed.':(asset.setup_reason||'No qualified market evidence yet.');
   }
-  const levels=confirmed?asset.levels:null;
+  const levels=confirmed?asset.levels:watching?asset.watch_levels:null;
   for(const id of ['entry','stop','tp1','tp2','tp3']) $(id).textContent=usd(levels?.[id]);
-  $('plan-status').textContent=levels?'TEST CANDIDATE':'NO SETUP';
-  $('plan-status').className='badge'+(levels?' green':'');
-  $('plan-reason').textContent=levels?'Stop considers 15M swing extremes plus ATR; 1R / 2R / 3R are indicative, not filled orders.':(asset.setup_reason||'Waiting for all six checks.');
+  $('plan-status').textContent=confirmed?'PAPER CANDIDATE':watching?'CONDITIONAL WATCH':'NO SETUP';
+  $('plan-status').className='badge'+(confirmed?' green':watching?' amber':'');
+  $('plan-reason').textContent=confirmed?'Market-price paper observation. ATR/swing stop, 1.2R / 2R / 3R targets; no fill or profitability claim.':watching?'ENTRY is a future trigger, NOT a market order. Wait for a new qualifying signal before treating this as active.':(asset.setup_reason||'Market evidence is mixed.');
+  const replay=asset.model_replay||{};
+  $('replay-summary').textContent=replay.trades>0
+    ?'SHORT HISTORICAL REPLAY · '+replay.trades+' simulated trades / '+replay.lookback_days+' days · '+replay.win_rate_pct+'% net-positive · '+(replay.net_r>0?'+':'')+replay.net_r+'R after assumed '+replay.cost_bps+'-bp round-trip costs. NOT out-of-sample validation.'
+    :'SHORT HISTORICAL REPLAY · '+(replay.note||'Waiting for enough closed candles. No reliable performance estimate yet.');
 }
 function renderZones(asset){
   const zones=asset.fvg_by_timeframe?.[selectedFvg] || (selectedFvg==='15m'?asset.fvg:[]) || [];
@@ -205,7 +213,7 @@ function signalLogRows(){
 function renderSignalLog(){
   $('signal-log-symbol').textContent=selected.startsWith('BTC')?'BTC':'ETH';
   const rows=signalLogRows();
-  $('signal-log').innerHTML=rows.length?rows.map(row=>'<tr><td>'+utcTime(row.ts)+'</td><td><span class="direction '+(row.side==='LONG'?'bull':'bear')+'">'+htmlSafe(row.side)+'</span><small class="strategy-version">'+htmlSafe(row.strategy_version||'LEGACY')+'</small></td><td>'+usd(row.entry)+'</td><td>'+usd(row.tp1)+'</td><td>'+usd(row.tp2)+'</td><td>'+usd(row.tp3)+'</td><td>'+usd(row.stop)+'</td><td><span class="outcome '+(row.status.includes('SL')?'bad':row.status.includes('TP')?'good':'')+'">'+htmlSafe(row.status)+'</span></td></tr>').join(''):'<tr><td colspan="8" class="no-signals">No six-gate test candidate issued yet. An aligned trend alone does not count as a trade.</td></tr>';
+  $('signal-log').innerHTML=rows.length?rows.map(row=>'<tr><td>'+utcTime(row.ts)+'</td><td><span class="direction '+(row.side==='LONG'?'bull':'bear')+'">'+htmlSafe(row.side)+'</span><small class="strategy-version">'+htmlSafe(row.strategy_version||'LEGACY')+(row.model_score!=null?' · '+htmlSafe(row.model_score)+'/100':'')+(row.setup_type?' · '+htmlSafe(row.setup_type):'')+'</small></td><td>'+usd(row.entry)+'</td><td>'+usd(row.tp1)+'</td><td>'+usd(row.tp2)+'</td><td>'+usd(row.tp3)+'</td><td>'+usd(row.stop)+'</td><td><span class="outcome '+(row.status.includes('SL')?'bad':row.status.includes('TP')?'good':'')+'">'+htmlSafe(row.status)+'</span></td></tr>').join(''):'<tr><td colspan="8" class="no-signals">No active paper entry recorded yet. Conditional WATCH plans are not treated as filled trades.</td></tr>';
 }
 function renderHistory(){
   const rows=current?.decision_log?.[selected] || [];

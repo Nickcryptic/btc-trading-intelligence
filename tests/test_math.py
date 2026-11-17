@@ -7,7 +7,7 @@ from pathlib import Path
 import app
 import math
 
-from app import ema, rsi, fvg_zones, score_label, kraken_result, parse_kraken_ohlc, parse_stablecoin_growth, halving_context, calc_asset, order_book_snapshot, observed_signal_status, recent_tape_snapshot, liquidity_observation, wide_liquidity_snapshot, parse_bybit_wide_book, build_broad_liquidity, professional_decision, structure_liquidity_targets
+from app import ema, rsi, fvg_zones, score_label, kraken_result, parse_kraken_ohlc, parse_stablecoin_growth, halving_context, calc_asset, order_book_snapshot, observed_signal_status, recent_tape_snapshot, liquidity_observation, wide_liquidity_snapshot, parse_bybit_wide_book, build_broad_liquidity, professional_decision, structure_liquidity_targets, replay_recent_candles
 
 def test_ema_constant():
     assert ema([10]*30,21)==10
@@ -173,7 +173,7 @@ def trend_candles(step=6,wiggle=35,volume=100):
     return rows
 
 
-def test_trade_requires_a_fresh_15m_trigger_and_volume():
+def test_adaptive_model_offers_watch_then_long_without_volume_veto():
     fifteen=trend_candles(step=4,wiggle=38)
     hour=trend_candles(step=9,wiggle=12)
     four=trend_candles(step=14,wiggle=8)
@@ -181,6 +181,9 @@ def test_trade_requires_a_fresh_15m_trigger_and_volume():
     # A clean higher-timeframe trend with no completed 15M trigger should WAIT.
     base=professional_decision(fifteen,hour,four,day,fifteen[-2]['close'],0.2)
     assert base['direction']=='NO TRADE'
+    assert base['watch_direction']=='LONG'
+    assert base['watch_levels']['entry']>fifteen[-2]['close']
+    assert base['signal_score']>=65
     last=fifteen[-2]
     prior_high=max(c['high'] for c in fifteen[-18:-2])
     last['close']=prior_high+35
@@ -192,11 +195,13 @@ def test_trade_requires_a_fresh_15m_trigger_and_volume():
     confirmed=professional_decision(fifteen,hour,four,day,price,0.2)
     assert confirmed['direction']=='LONG CANDIDATE',confirmed
     assert confirmed['trigger']=='15M BREAKOUT'
-    assert len(confirmed['checks'])==6 and all(x['ok'] for x in confirmed['checks'])
+    assert len(confirmed['checks'])==6
+    assert confirmed['signal_score']>=65
     assert confirmed['levels']['tp2']>confirmed['levels']['tp1']>price>confirmed['levels']['stop']
     last['volume']=50
     weak=professional_decision(fifteen,hour,four,day,price,0.2)
-    assert weak['direction']=='NO TRADE'
+    assert weak['direction']=='LONG CANDIDATE'  # Low volume is weak evidence, not an automatic veto.
+    assert weak['signal_score']<confirmed['signal_score']
     assert weak['checks'][3]['ok'] is False
     last['volume']=175
     chased=professional_decision(fifteen,hour,four,day,price+300,0.2)
@@ -204,7 +209,7 @@ def test_trade_requires_a_fresh_15m_trigger_and_volume():
     assert chased['checks'][4]['ok'] is False
 
 
-def test_short_signal_uses_the_same_six_checks():
+def test_short_signal_uses_symmetric_score_and_risk():
     fifteen=trend_candles(step=-4,wiggle=38)
     hour=trend_candles(step=-9,wiggle=12)
     four=trend_candles(step=-14,wiggle=8)
@@ -220,7 +225,87 @@ def test_short_signal_uses_the_same_six_checks():
     reading=professional_decision(fifteen,hour,four,day,price,0.2)
     assert reading['direction']=='SHORT CANDIDATE',reading
     assert reading['levels']['stop']>price>reading['levels']['tp2']
-    assert all(x['ok'] for x in reading['checks'])
+    assert reading['signal_score']>=65
+    assert reading['trigger']=='15M BREAKDOWN'
+
+
+def test_invalid_spread_or_overextended_quote_stays_conditional():
+    fifteen=trend_candles(step=4,wiggle=38)
+    hour=trend_candles(step=9,wiggle=12)
+    four=trend_candles(step=14,wiggle=8)
+    day=trend_candles(step=17,wiggle=5)
+    close=fifteen[-2]['close']
+    baseline=professional_decision(fifteen,hour,four,day,close,0.2)
+    assert baseline['watch_direction']=='LONG'
+    # An actual qualified trigger cannot override spread or no-chase safeguards.
+    candle=fifteen[-2]
+    candle['close']=max(x['high'] for x in fifteen[-14:-2])+35
+    candle['open']=candle['close']-60
+    candle['high']=candle['close']+20
+    candle['low']=candle['open']-20
+    guarded=professional_decision(fifteen,hour,four,day,candle['close'],12)
+    assert guarded['direction']=='NO TRADE'
+    assert guarded['watch_direction']=='LONG'
+    assert guarded['checks'][4]['ok'] is False
+    far=professional_decision(fifteen,hour,four,day,candle['close']+500,0.2)
+    assert far['direction']=='NO TRADE'
+    assert far['checks'][4]['ok'] is False
+
+
+def test_open_candles_cannot_repaint_completed_candle_signal():
+    frames=[trend_candles(step,wiggle) for step,wiggle in ((4,38),(9,12),(14,8),(17,5))]
+    price=frames[0][-2]['close']
+    before=professional_decision(*frames,price,0.2)
+    for rows in frames:
+        rows[-1].update({'close':1,'high':1_000_000,'low':1,'volume':1_000_000})
+    after=professional_decision(*frames,price,0.2)
+    assert before['direction']==after['direction']
+    assert before['signal_score']==after['signal_score']
+    assert before['watch_levels']==after['watch_levels']
+
+
+def test_live_direction_ignores_independent_book_pressure():
+    f=trend_candles(step=4,wiggle=38)
+    h=trend_candles(step=9,wiggle=12)
+    g=trend_candles(step=14,wiggle=8)
+    d=trend_candles(step=17,wiggle=5)
+    last=f[-2]
+    last['close']=max(c['high'] for c in f[-14:-2])+35
+    last['open']=last['close']-72
+    last['high']=last['close']+52
+    last['low']=last['open']-55
+    last['volume']=175
+    price=last['close']+2
+    ticker={'lastPrice':str(price),'priceChangePercent':'2'}
+    def evaluate(bid_qty,ask_qty):
+        book={'bids':[[str(price-.2),str(bid_qty)]], 'asks':[[str(price+.2),str(ask_qty)]]}
+        return calc_asset('BTCUSDT',f,h,g,d,ticker,book,[],None,None)
+    heavy_buy=evaluate(900,1)
+    heavy_sell=evaluate(1,900)
+    assert heavy_buy['direction']=='LONG CANDIDATE'
+    assert heavy_sell['direction']==heavy_buy['direction']
+    assert heavy_sell['signal_score']==heavy_buy['signal_score']
+
+
+def test_replay_reports_costed_research_sample_or_no_history():
+    assert replay_recent_candles([],[],[],[])['status']=='INSUFFICIENT HISTORY'
+    end=260*86_400_000
+    def bars(period_ms,n):
+        def value(t):
+            return 80_000+t/86_400_000*60+20*math.sin(t/3_600_000*.37)
+        return [{'ts':end-(n-i)*period_ms,
+                 'open':value(end-(n-i)*period_ms),
+                 'high':value(end-(n-i)*period_ms)+90,
+                 'low':value(end-(n-i)*period_ms)-90,
+                 'close':value(end-(n-i-1)*period_ms),
+                 'volume':100+20*math.sin(i*.3)} for i in range(n)]
+    replay=replay_recent_candles(bars(900_000,690),bars(3_600_000,600),
+                                 bars(14_400_000,700),bars(86_400_000,259))
+    assert replay['status']=='LIMITED HISTORICAL REPLAY'
+    assert replay['trades']>0
+    assert replay['cost_bps']==20
+    assert 0<=replay['win_rate_pct']<=100
+    assert 'net_r' in replay
 
 
 def test_order_book_depth_and_price_bands():
@@ -275,15 +360,19 @@ def test_signal_journal_de_duplicates_immediate_candidates():
             app.init_db()
             levels={'entry':100,'stop':95,'tp1':105,'tp2':110,'tp3':115}
             asset={'direction':'LONG CANDIDATE','levels':levels,'price':100,'bias':54,'timing':44}
+            asset.update({'signal_candle_ts':1700000000000,'signal_score':74,'setup_trigger':'15M MOMENTUM CONTINUATION'})
             first=app.record_signal_log('BTCUSDT',asset,'NO TRADE')
             assert len(first)==1
             assert first[0]['status']=='TRACKING'
-            assert first[0]['strategy_version']=='0.7.0'
+            assert first[0]['strategy_version']=='0.8.0'
+            assert first[0]['model_score']==74
+            assert first[0]['candle_ts']==1700000000000
             second=app.record_signal_log('BTCUSDT',asset,'LONG CANDIDATE')
             assert len(second)==1
             asset['price']=106
             reached=app.record_signal_log('BTCUSDT',asset,'LONG CANDIDATE')
             assert reached[0]['status']=='TP1 SEEN'
+            assert len(reached)==1
         finally:
             app.DB_PATH=previous_path
 

@@ -23,7 +23,8 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'version': '0.7.0'}
+STRATEGY_VERSION = '0.8.0'
+STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
 
@@ -36,6 +37,12 @@ def init_db():
         columns={row[1] for row in db.execute('PRAGMA table_info(signals)')}
         if 'strategy_version' not in columns:
             db.execute("ALTER TABLE signals ADD COLUMN strategy_version TEXT DEFAULT 'LEGACY'")
+        if 'candle_ts' not in columns:
+            db.execute('ALTER TABLE signals ADD COLUMN candle_ts INTEGER')
+        if 'model_score' not in columns:
+            db.execute('ALTER TABLE signals ADD COLUMN model_score INTEGER')
+        if 'setup_type' not in columns:
+            db.execute('ALTER TABLE signals ADD COLUMN setup_type TEXT')
         db.execute('CREATE TABLE IF NOT EXISTS wintermute (id INTEGER PRIMARY KEY, ts TEXT, signal TEXT, note TEXT)')
 
 
@@ -334,7 +341,7 @@ def liquidity_observation(asset, previous=None):
 def observed_signal_status(row, price):
     """Update only from observed poll prices; never claim that a limit order filled."""
     old=row['status']
-    if old in ('SL SEEN','SL AFTER TP1','SL AFTER TP2','TP3 SEEN'):
+    if old in ('SL SEEN','SL AFTER TP1','SL AFTER TP2','TP3 SEEN','EXPIRED / UNRESOLVED'):
         return old
     long=row['side']=='LONG'
     stop_hit=price<=row['stop'] if long else price>=row['stop']
@@ -351,13 +358,15 @@ def observed_signal_status(row, price):
 
 
 def record_signal_log(symbol, asset, previous_direction):
-    """Store distinct/test candidate observations, no more than once per 30m for unchanged bias."""
+    """Only journal actual paper candidates, at most once per side per hour."""
     now=datetime.now(timezone.utc)
     with sqlite3.connect(DB_PATH) as db:
         db.row_factory=sqlite3.Row
         existing=list(db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 50',(symbol,)))
         for row in existing:
             next_status=observed_signal_status(row,asset['price'])
+            if next_status=='TRACKING' and (now-datetime.fromisoformat(row['ts'])).total_seconds()>12*3600:
+                next_status='EXPIRED / UNRESOLVED'
             if next_status!=row['status']:
                 db.execute('UPDATE signals SET status=? WHERE id=?',(next_status,row['id']))
         direction=asset['direction']
@@ -366,11 +375,13 @@ def record_signal_log(symbol, asset, previous_direction):
             last=existing[0] if existing else None
             elapsed=(now-datetime.fromisoformat(last['ts'])).total_seconds() if last else float('inf')
             side='LONG' if direction.startswith('LONG') else 'SHORT'
-            newly_issued=previous_direction!=direction
-            if not last or last['strategy_version']!='0.7.0' or (newly_issued and (last['side']!=side or elapsed>=120)) or elapsed>=1800:
-                db.execute('INSERT INTO signals(ts,symbol,side,entry,stop,tp1,tp2,tp3,bias,timing,status,strategy_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+            same_candle=last and last['strategy_version']==STRATEGY_VERSION and last['side']==side and last['candle_ts']==asset.get('signal_candle_ts')
+            distinct=not last or last['side']!=side or last['strategy_version']!=STRATEGY_VERSION
+            if not same_candle and (distinct and (not last or elapsed>=120) or elapsed>=3600):
+                db.execute('INSERT INTO signals(ts,symbol,side,entry,stop,tp1,tp2,tp3,bias,timing,status,strategy_version,candle_ts,model_score,setup_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                            (now.isoformat(),symbol,side,levels['entry'],levels['stop'],
-                            levels['tp1'],levels['tp2'],levels['tp3'],asset['bias'],asset['timing'],'TRACKING','0.7.0'))
+                            levels['tp1'],levels['tp2'],levels['tp3'],asset['bias'],asset['timing'],
+                            'TRACKING',STRATEGY_VERSION,asset.get('signal_candle_ts'),asset.get('signal_score'),asset.get('setup_trigger')))
         return [dict(row) for row in db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5',(symbol,))]
 
 
@@ -519,7 +530,8 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
     if halving:
         indicators.append({'name':'Bitcoin Halving Cycle','value':f'{halving["blocks_remaining"]:,} blocks left',
                            'signal':'NEUTRAL','source':halving['source']+' · context only'})
-    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'signal_checks':decision['checks'],'setup_reason':decision['reason'],'setup_trigger':decision['trigger'],'setup_volume_ratio':decision['volume_ratio'],'structure_targets':structure_targets,'indicators':indicators,'fvg':zones,'fvg_by_timeframe':zones_by_timeframe,'order_book':order_book_snapshot(book,price),'recent_tape':recent_tape_snapshot(trades),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Strict trend/trigger/volume/risk rules evaluated live. Actual profitability has not been backtested or established.'}
+    replay=replay_recent_candles(k15,k1h,k4h,kd)
+    return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'signal_checks':decision['checks'],'signal_score':decision['signal_score'],'signal_grade':decision['signal_grade'],'signal_candle_ts':decision['signal_candle_ts'],'watch_direction':decision['watch_direction'],'watch_levels':decision['watch_levels'],'trigger_price':decision['trigger_price'],'setup_reason':decision['reason'],'setup_trigger':decision['trigger'],'setup_volume_ratio':decision['volume_ratio'],'model_replay':replay,'structure_targets':structure_targets,'indicators':indicators,'fvg':zones,'fvg_by_timeframe':zones_by_timeframe,'order_book':order_book_snapshot(book,price),'recent_tape':recent_tape_snapshot(trades),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Weighted 1D/4H/1H/15M evidence and explicit safety vetoes evaluated live; no validated profitability or fill guarantee.'}
 
 
 def parse_klines(rows):
@@ -564,105 +576,215 @@ def build_broad_liquidity(payload,symbol,fallback_book,price,fallback_source):
 
 
 def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
-    """Conservative, test-only trend/trigger/risk gates; scores are NOT win probabilities."""
+    """Adaptive, *unvalidated* trend/pullback model; points are evidence, not win odds.
+
+    Only completed 15M/1H/4H/1D candles influence direction; the live quote
+    influences entry distance and stop/target geometry. Resting liquidity is
+    intentionally excluded. A WATCH plan is conditional and never journaled.
+    """
     result={'bias':None,'timing':None,'direction':'NO TRADE','levels':None,
-            'checks':[],'trigger':'NONE','volume_ratio':None,
+            'watch_direction':None,'watch_levels':None,'signal_score':0,
+            'signal_grade':'NONE','signal_candle_ts':None,'trigger':'NONE',
+            'trigger_price':None,'volume_ratio':None,'checks':[],
             'reason':'Insufficient completed candle history.'}
     c15,c1,c4,cd=(k15[:-1],k1h[:-1],k4h[:-1],kd[:-1])
-    if min(len(c15),len(c1),len(c4))<70 or len(cd)<200 or price<=0:
+    if min(len(c15),len(c1),len(c4))<70 or len(cd)<200 or not math.isfinite(price) or price<=0:
         return result
-    values=lambda rows:[c['close'] for c in rows]
-    v15,v1,v4,vd=map(values,(c15,c1,c4,cd))
-    ma200=sum(vd[-200:])/200
-    ma50=sum(vd[-50:])/50
-    e4=ema(v4,21); e4past=ema(v4[:-4],21)
-    e1=ema(v1,21); e1past=ema(v1[:-4],21); e1slow=ema(v1,55)
-    e9=ema(v15,9); e21=ema(v15,21)
-    rsi15=rsi(v15)
-    direction=lambda bullish,bearish:1 if bullish else -1 if bearish else 0
-    daily=direction(vd[-1]>ma200,vd[-1]<ma200)
-    cross=direction(ma50>ma200,ma50<ma200)
-    four=direction(v4[-1]>e4 and e4>e4past,v4[-1]<e4 and e4<e4past)
-    hour=direction(v1[-1]>e1>e1slow and e1>e1past,
-                   v1[-1]<e1<e1slow and e1<e1past)
-    fifteen=direction(v15[-1]>e9>e21,v15[-1]<e9<e21)
-    healthy_rsi=direction(52<=rsi15<=80,20<=rsi15<=48)
-    hour_momentum=direction(v1[-1]>v1[-5],v1[-1]<v1[-5])
-    bias=round(30*daily+25*cross+45*four)
-    timing=round(35*hour+30*fifteen+20*healthy_rsi+15*hour_momentum)
-    result.update({'bias':bias,'timing':timing})
-
-    side=1 if bias>=55 and timing>=55 else -1 if bias<=-55 and timing<=-55 else 0
-    regime=side!=0 and daily==four==side
-    execution=side!=0 and hour==fifteen==healthy_rsi==side
-    last=c15[-1]; previous=c15[-17:-1]
-    prior_high=max(c['high'] for c in previous)
-    prior_low=min(c['low'] for c in previous)
+    v15=[c['close'] for c in c15]; v1=[c['close'] for c in c1]
+    v4=[c['close'] for c in c4]; vd=[c['close'] for c in cd]
     a=atr(c15)
+    if not a or a<=0:
+        return result
+    e4=ema(v4,21); p4=ema(v4[:-3],21)
+    e1=ema(v1,21); p1=ema(v1[:-3],21); slow1=ema(v1,55)
+    e9=ema(v15,9); e21=ema(v15,21)
+    r15=rsi(v15)
+    ma200=sum(vd[-200:])/200; ma50=sum(vd[-50:])/50
+    sign=lambda yes,no:1 if yes else -1 if no else 0
+    four=sign(v4[-1]>e4 and e4>p4,v4[-1]<e4 and e4<p4)
+    hour=sign(v1[-1]>e1>slow1 and e1>p1,v1[-1]<e1<slow1 and e1<p1)
+    fifteen=sign(v15[-1]>e9>e21,v15[-1]<e9<e21)
+    daily=sign(vd[-1]>ma200,vd[-1]<ma200)
+    cross=sign(ma50>ma200,ma50<ma200)
+    hour_move=sign(v1[-1]>v1[-5],v1[-1]<v1[-5])
+    rsi_direction=sign(50<=r15<78,22<r15<=50)
+    result.update({'bias':60*four+25*daily+15*cross,
+                   'timing':45*hour+30*fifteen+15*hour_move+10*rsi_direction,
+                   'signal_candle_ts':c15[-1]['ts']})
+    last=c15[-1]
     typical_volume=median(c['volume'] for c in c15[-21:-1])
     ratio=last['volume']/typical_volume if typical_volume>0 else 0
     result['volume_ratio']=round(ratio,2)
-    trend_check=bool(regime and execution)
-    trigger='NONE'
-    body=abs(last['close']-last['open'])
-    if a and body>=0.2*a:
-        if side==1 and last['close']>last['open']:
-            if last['close']>prior_high+0.05*a:trigger='15M BREAKOUT'
-            elif last['low']<prior_low-0.05*a and last['close']>prior_low+0.05*a:trigger='15M SWEEP / RECLAIM'
-            elif last['low']<=e21+0.1*a and last['close']>c15[-2]['high'] and last['close']>e9:
-                trigger='15M TREND PULLBACK'
-        if side==-1 and last['close']<last['open']:
-            if last['close']<prior_low-0.05*a:trigger='15M BREAKDOWN'
-            elif last['high']>prior_high+0.05*a and last['close']<prior_high-0.05*a:trigger='15M SWEEP / REJECTION'
-            elif last['high']>=e21-0.1*a and last['close']<c15[-2]['low'] and last['close']<e9:
-                trigger='15M TREND PULLBACK'
-    result['trigger']=trigger
-    participation=ratio>=1.15
-    volatility=bool(a and 0.08<=a/price*100<=2.5)
-    not_chasing=bool(a and abs(price-last['close'])<=0.8*a and
-                    abs(last['close']-e21)<=3*a)
-    spread_ok=spread is not None and 0<=spread<=3
-    entry_quality=volatility and not_chasing and spread_ok
-    proposed=None
-    risk_ok=False
-    room_ok=True
-    if side and a:
-        entry=price
+    prior=c15[-13:-1]; recent=c15[-4:]
+
+    def pattern(side):
         if side==1:
-            stop=min(min(c['low'] for c in c15[-10:])-0.25*a,entry-1.2*a)
+            if last['close']>max(c['high'] for c in prior)+0.05*a:
+                return '15M BREAKOUT'
+            if min(c['low'] for c in recent)<=e21+0.45*a and last['close']>e9 and last['close']>c15[-2]['close']:
+                return '15M PULLBACK / RECLAIM'
+            if last['close']>e9 and last['close']>c15[-4]['close'] and sum(x['close']>x['open'] for x in recent)>=2:
+                return '15M MOMENTUM CONTINUATION'
         else:
-            stop=max(max(c['high'] for c in c15[-10:])+0.25*a,entry+1.2*a)
+            if last['close']<min(c['low'] for c in prior)-0.05*a:
+                return '15M BREAKDOWN'
+            if max(c['high'] for c in recent)>=e21-0.45*a and last['close']<e9 and last['close']<c15[-2]['close']:
+                return '15M PULLBACK / REJECTION'
+            if last['close']<e9 and last['close']<c15[-4]['close'] and sum(x['close']<x['open'] for x in recent)>=2:
+                return '15M MOMENTUM CONTINUATION'
+        return 'NONE'
+
+    def score(side):
+        p=pattern(side)
+        momentum_ok=hour_move==side or (v15[-1]-v15[-4])*side>0
+        rsi_ok=(40<=r15<=78 if side==1 else 18<=r15<=60)
+        pts=(25 if four==side else 0)+(25 if hour==side else 0)
+        pts+=(15 if fifteen==side else 0)
+        pts+=(15 if p in ('15M BREAKOUT','15M BREAKDOWN','15M PULLBACK / RECLAIM','15M PULLBACK / REJECTION')
+              else 10 if p!='NONE' else 0)
+        pts+=10 if rsi_ok and momentum_ok else 5 if rsi_ok or momentum_ok else 0
+        pts+=5 if ratio>=1 else 3 if ratio>=0.7 else 0
+        pts+=5 if daily==side else 0
+        return pts,p
+
+    long_score,long_pattern=score(1)
+    short_score,short_pattern=score(-1)
+    side=1 if long_score>short_score else -1
+    points=max(long_score,short_score)
+    trigger=long_pattern if side==1 else short_pattern
+    other=min(long_score,short_score)
+    result.update({'signal_score':points,'signal_grade':'HIGH' if points>=85 else 'MODERATE' if points>=65 else 'DEVELOPING' if points>=45 else 'NONE',
+                   'trigger':trigger})
+    if points<45 or points-other<15:
+        result['reason']='No directional edge: trend and momentum scores are mixed.'
+        return result
+
+    # Safety checks are vetoes; volume and a perfect 1D alignment are not.
+    anchor=(hour==side or (four==side and fifteen==side))
+    volatility=0.06<=a/price*100<=2.8
+    spread_ok=spread is not None and math.isfinite(spread) and 0<=spread<=5
+    not_chasing=abs(price-last['close'])<=1.6*a and abs(price-e21)<=3.8*a
+    not_exhausted=16<r15<86
+    def plan(entry):
+        swing=(min(c['low'] for c in c15[-7:]) if side==1 else
+               max(c['high'] for c in c15[-7:]))
+        stop=(min(swing-0.12*a,entry-1.25*a) if side==1 else
+              max(swing+0.12*a,entry+1.25*a))
         risk=abs(entry-stop)
-        risk_ok=0.15<=risk/entry*100<=1.8
-        if targets:
-            opposite='above' if side==1 else 'below'
-            candidates=[z for z in targets.get(opposite,[]) if z['touches']>=2 and
-                        ((z['low']>entry) if side==1 else (z['high']<entry))]
-            if candidates:
-                nearest=min(candidates,key=lambda z:abs(z['price']-entry))
-                distance=abs((nearest['low'] if side==1 else nearest['high'])-entry)
-                room_ok=distance>=1.5*risk
-        proposed={'entry':round(entry,2),'stop':round(stop,2),
-                  'tp1':round(entry+side*risk,2),
-                  'tp2':round(entry+side*2*risk,2),
-                  'tp3':round(entry+side*3*risk,2),
-                  'status':'ILLUSTRATIVE / NOT CONFIRMED'}
+        valid=0.12<=risk/entry*100<=2.2 and risk<=3.2*a
+        if not valid:
+            return None
+        return {'entry':round(entry,2),'stop':round(stop,2),
+                'tp1':round(entry+side*1.2*risk,2),
+                'tp2':round(entry+side*2*risk,2),
+                'tp3':round(entry+side*3*risk,2),
+                'risk_pct':round(100*risk/entry,2),
+                'status':'PAPER RESEARCH — NOT FILLED'}
+
+    # A watch presents a precise *future trigger*, never mistaken for a market fill.
+    watch_entry=(max(price+0.1*a,max(c['high'] for c in c15[-5:])+0.05*a)
+                 if side==1 else min(price-0.1*a,min(c['low'] for c in c15[-5:])-0.05*a))
+    watch=plan(watch_entry)
+    active=plan(price)
+    risk_ok=active is not None
+    required_ok=anchor and spread_ok and volatility and not_chasing and not_exhausted and risk_ok
     checks=[
-        {'label':'1D + 4H regime', 'ok':bool(regime),'detail':('ALIGNED' if regime else 'NOT ALIGNED')},
-        {'label':'1H + 15M trend', 'ok':bool(execution),'detail':('ALIGNED' if execution else 'NOT ALIGNED')},
-        {'label':'15M price-action trigger', 'ok':trigger!='NONE','detail':trigger if trigger!='NONE' else 'NOT TRIGGERED'},
-        {'label':'15M volume confirmation', 'ok':participation,'detail':f'{ratio:.2f}× vs median'},
-        {'label':'Spread + ATR + no chase','ok':entry_quality,'detail':'ACCEPTABLE' if entry_quality else 'FILTERED'},
-        {'label':'Stop size + target room','ok':risk_ok and room_ok,
-         'detail':'ACCEPTABLE' if risk_ok and room_ok else 'RISK / ROOM FILTER'}]
+        {'label':'4H trend', 'ok':four==side,'detail':'ALIGNED' if four==side else 'COUNTERTREND'},
+        {'label':'1H execution trend','ok':hour==side,'detail':'ALIGNED' if hour==side else 'MIXED'},
+        {'label':'15M price action','ok':trigger!='NONE','detail':trigger if trigger!='NONE' else 'DEVELOPING'},
+        {'label':'15M participation','ok':ratio>=0.7,'detail':f'{ratio:.2f}× median · bonus only'},
+        {'label':'Spread + ATR + no chase','ok':spread_ok and volatility and not_chasing and not_exhausted,
+         'detail':'SAFE RANGE' if spread_ok and volatility and not_chasing and not_exhausted else 'RISK FILTER'},
+        {'label':'Stop geometry','ok':risk_ok,'detail':f'{active["risk_pct"]:.2f}% risk' if active else 'TOO WIDE / TIGHT'}]
     result['checks']=checks
-    failed=next((c for c in checks if not c['ok']),None)
-    if not failed:
+    result['trigger_price']=round(watch_entry,2)
+    result['watch_direction']='LONG' if side==1 else 'SHORT'
+    result['watch_levels']=watch
+    if required_ok and points>=65 and trigger!='NONE':
         result.update({'direction':'LONG CANDIDATE' if side==1 else 'SHORT CANDIDATE',
-                       'levels':proposed,'reason':f'{trigger} confirmed by trend, volume and risk gates. Paper candidate only.'})
+                       'levels':active,
+                       'reason':f'{points}/100 evidence · {trigger.lower()} · {active["risk_pct"]:.2f}% defined stop. Paper signal, not a verified edge.'})
     else:
-        result['reason']=f'No trade: {failed["label"].lower()} — {failed["detail"].lower()}.'
+        blockers=[]
+        if not anchor:blockers.append('1H/4H anchor not yet aligned')
+        if points<65:blockers.append(f'evidence {points}/100, needs 65')
+        if trigger=='NONE':blockers.append('no recent 15M continuation/reclaim')
+        if not (spread_ok and volatility and not_chasing and not_exhausted):blockers.append('spread / volatility / chase filter')
+        if not risk_ok:blockers.append('stop geometry')
+        result['reason']=f'Conditional {result["watch_direction"]} above/below ${watch_entry:,.2f}; waiting: '+', '.join(blockers)+'.'
     return result
+
+
+def replay_recent_candles(k15,k1h,k4h,kd,round_trip_cost_bps=20):
+    """Small, conservative OHLC sanity check, NOT an out-of-sample performance claim.
+
+    At each 15M close only *then-completed* higher-timeframe candles are shown
+    to the model. Assumes a synthetic 1-bp spread for historical decisions,
+    next-candle-open fills, stop-first intrabar ties, 2R exit/12H expiry, and
+    a fixed round-trip fee+slippage. Does not reconstruct real order-book fills.
+    """
+    closed=k15[:-1]
+    if len(closed)<180:
+        return {'status':'INSUFFICIENT HISTORY','trades':0,'note':'Need more than 180 completed 15M candles.'}
+    hold_bars=48
+    earliest=max(80,len(closed)-480)
+    cutoff=len(closed)-hold_bars-1
+    if cutoff<=earliest:
+        return {'status':'INSUFFICIENT HISTORY','trades':0,'note':'Not enough forward candles for the 12H holding window.'}
+    costs=round_trip_cost_bps/10000
+    positions=[]
+    i=earliest
+    while i<cutoff:
+        asof=closed[i]['ts']+900_000
+        h1=[x for x in k1h if x['ts']+3_600_000<=asof]
+        h4=[x for x in k4h if x['ts']+14_400_000<=asof]
+        hd=[x for x in kd if x['ts']+86_400_000<=asof]
+        if min(len(h1),len(h4))<70 or len(hd)<200:
+            i+=1
+            continue
+        # Dummy currently forming bars are deliberately duplicates of known
+        # candles; professional_decision discards the final element on each TF.
+        dummy=lambda rows:[*rows,dict(rows[-1])]
+        evaluated=professional_decision(dummy(closed[:i+1]),dummy(h1),dummy(h4),dummy(hd),closed[i]['close'],1)
+        if evaluated['direction'] not in ('LONG CANDIDATE','SHORT CANDIDATE'):
+            i+=1
+            continue
+        side=1 if evaluated['direction']=='LONG CANDIDATE' else -1
+        next_bar=closed[i+1]
+        entry=next_bar['open']
+        original=evaluated['levels']['entry']
+        stop=evaluated['levels']['stop']
+        risk=abs(entry-stop)
+        a=atr(closed[:i+1])
+        if risk<=0 or (entry-stop)*side<=0 or abs(entry-original)>0.5*a:
+            i+=1
+            continue
+        target=entry+side*2*risk
+        exit_i=i+hold_bars
+        gross_r=side*(closed[exit_i]['close']-entry)/risk
+        for j in range(i+1,exit_i+1):
+            bar=closed[j]
+            # If both limits are crossed within one 15M candle, assume loss.
+            if (bar['low']<=stop if side==1 else bar['high']>=stop):
+                gross_r=-1
+                exit_i=j
+                break
+            if (bar['high']>=target if side==1 else bar['low']<=target):
+                gross_r=2
+                exit_i=j
+                break
+        net_r=gross_r-entry*costs/risk
+        positions.append(net_r)
+        i=max(i+4,exit_i+1)  # One position at a time, no overlapping paper trades.
+    days=round((closed[cutoff]['ts']-closed[earliest]['ts'])/86_400_000,1)
+    if not positions:
+        return {'status':'NO HISTORICAL CANDIDATES','trades':0,'lookback_days':days,
+                'cost_bps':round_trip_cost_bps,'note':'No completed, non-overlapping candidates in this limited candle window.'}
+    return {'status':'LIMITED HISTORICAL REPLAY','trades':len(positions),'lookback_days':days,
+            'win_rate_pct':round(sum(r>0 for r in positions)/len(positions)*100,1),
+            'net_r':round(sum(positions),2),'avg_net_r':round(sum(positions)/len(positions),2),
+            'cost_bps':round_trip_cost_bps,
+            'note':'Next 15M open entry; 2R target, stop-first ties, max 12H; 20-bp assumed round-trip costs and synthetic 1-bp spread. Short window, not independent validation.'}
 
 
 async def fetch_asset_binance(client,symbol,macro=None):
@@ -803,7 +925,7 @@ async def lifespan(app):
     try: await wintermute_task
     except asyncio.CancelledError: pass
 
-app=FastAPI(title='BTC Intelligence',version='0.7.0',lifespan=lifespan)
+app=FastAPI(title='BTC Intelligence',version=STRATEGY_VERSION,lifespan=lifespan)
 
 
 @app.middleware('http')

@@ -68,6 +68,7 @@ h1 em{font-style:normal;color:var(--mint)}
 .gate-icon.pending{background:#273949;color:#7995a9}
 .signal-disclaimer{color:#748ca3;font-size:10px;line-height:1.6;margin-top:18px}
 .signal-disclaimer b{color:#d9ad69;font-weight:600}
+.replay-summary{margin-top:12px;padding:10px 12px;border:1px solid #30465b;border-radius:8px;background:#101f30;color:#aabfd1;font-size:10px;line-height:1.6}
 .score-stack{display:grid;gap:17px;grid-template-rows:1fr 1fr}
 .score-card{padding:25px 26px;background:linear-gradient(130deg,#131f35,#0d192c)}
 .bias-card{border-left:3px solid var(--purple)}
