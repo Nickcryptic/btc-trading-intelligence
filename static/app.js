@@ -197,8 +197,16 @@ function renderLiquidity(asset,stale){
     return '<div class="liquidity-sequence-row"><time>'+shortTime(row.ts)+'</time><span>'+bid+'</span><span>'+taker+'</span><b class="liq-label '+tone+'">'+htmlSafe(label)+'</b></div>';
   }).join(''):'<p class="placeholder">The first observation will appear after a successful exchange poll.</p>';
 }
-const journalKey = symbol => 'btc-intel-signal-journal-v082-'+symbol;
-const currentJournalVersion = '0.8.2';
+// Retire every obsolete browser journal key; old cached rows must never reappear.
+try {
+  for(let i=localStorage.length-1;i>=0;i--){
+    const key=localStorage.key(i);
+    if(key&&key.startsWith('btc-intel-signal-journal-')&&!key.startsWith('btc-intel-signal-journal-v083-'))
+      localStorage.removeItem(key);
+  }
+}catch{/* private browsing */}
+const journalKey = symbol => 'btc-intel-signal-journal-v083-'+symbol;
+const currentJournalVersion = '0.8.3';
 const signalId = row => String(row.ts)+'|'+String(row.entry)+'|'+String(row.side);
 function cachedSignalRows(symbol){
   let cached=[];

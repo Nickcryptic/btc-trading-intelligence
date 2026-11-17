@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.8.2'
+STRATEGY_VERSION = '0.8.3'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1109,7 +1109,7 @@ async def optional_private_access(request: Request, call_next):
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 
 @app.get('/')
-async def index(): return FileResponse(ROOT/'static'/'index.html')
+async def index(): return FileResponse(ROOT/'static'/'index.html',headers={'Cache-Control':'no-store, max-age=0, must-revalidate'})
 
 @app.get('/api/health')
 async def health(): return {'ok':True,'version':STATE['version'],'updated':STATE['updated'],'assets_live':list(STATE['assets'])}
@@ -1122,9 +1122,12 @@ async def state():
         for rows in data['liquidity_history'].values():
             for row in rows:
                 row.pop('book_snapshot',None)
-        return data
+        # Never expose migrated legacy rows, including any stale in-memory snapshot.
+        data['signal_log']={symbol:[row for row in rows if row.get('strategy_version')==STRATEGY_VERSION][:5]
+                            for symbol,rows in data['signal_log'].items()}
+        return JSONResponse(data,headers={'Cache-Control':'no-store, max-age=0'})
 
-
+ 
 @app.post('/api/reconcile-cached-signals')
 async def reconcile_cached_signals(request: Request):
     """Re-check browser-only paper rows after ephemeral server DB replacement.
