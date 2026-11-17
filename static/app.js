@@ -197,18 +197,19 @@ function renderLiquidity(asset,stale){
     return '<div class="liquidity-sequence-row"><time>'+shortTime(row.ts)+'</time><span>'+bid+'</span><span>'+taker+'</span><b class="liq-label '+tone+'">'+htmlSafe(label)+'</b></div>';
   }).join(''):'<p class="placeholder">The first observation will appear after a successful exchange poll.</p>';
 }
-const journalKey = symbol => 'btc-intel-signal-journal-v04-'+symbol;
+const journalKey = symbol => 'btc-intel-signal-journal-v082-'+symbol;
+const currentJournalVersion = '0.8.2';
 const signalId = row => String(row.ts)+'|'+String(row.entry)+'|'+String(row.side);
 function cachedSignalRows(symbol){
   let cached=[];
   try{cached=JSON.parse(localStorage.getItem(journalKey(symbol))||'[]');if(!Array.isArray(cached))cached=[]}catch{cached=[]}
-  return cached;
+  return cached.filter(row=>row.strategy_version===currentJournalVersion).slice(0,5);
 }
 function storeSignalRows(symbol,rows){
   try{localStorage.setItem(journalKey(symbol),JSON.stringify(rows))}catch{/* privacy mode may block storage */}
 }
 function signalLogRows(){
-  const fresh=current?.signal_log?.[selected]||[];
+  const fresh=(current?.signal_log?.[selected]||[]).filter(row=>row.strategy_version===currentJournalVersion);
   const cached=cachedSignalRows(selected);
   const ids=new Set();
   const merged=[...fresh,...cached].filter(row=>{
@@ -221,7 +222,7 @@ function signalLogRows(){
 }
 async function reconcileBrowserHistory(){
   await Promise.all(['BTCUSDT','ETHUSDT'].map(async symbol=>{
-    const fresh=current?.signal_log?.[symbol]||[];
+    const fresh=(current?.signal_log?.[symbol]||[]).filter(row=>row.strategy_version===currentJournalVersion);
     const cached=cachedSignalRows(symbol);
     const freshIds=new Set(fresh.map(signalId));
     const orphan=cached.filter(row=>!freshIds.has(signalId(row))).slice(0,5);

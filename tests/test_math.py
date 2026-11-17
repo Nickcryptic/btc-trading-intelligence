@@ -439,7 +439,7 @@ def test_signal_journal_de_duplicates_immediate_candidates():
             first=app.record_signal_log('BTCUSDT',asset,'NO TRADE')
             assert len(first)==1
             assert first[0]['status']=='TRACKING'
-            assert first[0]['strategy_version']=='0.8.1'
+            assert first[0]['strategy_version']=='0.8.2'
             assert first[0]['model_score']==74
             assert first[0]['candle_ts']==1700000000000
             second=app.record_signal_log('BTCUSDT',asset,'LONG CANDIDATE')
@@ -454,7 +454,7 @@ def test_signal_journal_de_duplicates_immediate_candidates():
             app.DB_PATH=previous_path
 
 
-def test_legacy_signal_records_survive_version_migration():
+def test_legacy_signal_records_are_retired_on_version_migration():
     previous_path=app.DB_PATH
     with tempfile.TemporaryDirectory() as temp:
         app.DB_PATH=Path(temp)/'legacy.db'
@@ -465,7 +465,31 @@ def test_legacy_signal_records_survive_version_migration():
             app.init_db()
             with sqlite3.connect(app.DB_PATH) as db:
                 row=db.execute('SELECT strategy_version,status,entry FROM signals').fetchone()
-            assert row==('LEGACY','TRACKING',100)
+            assert row is None
+        finally:
+            app.DB_PATH=previous_path
+
+
+
+def test_journal_fifo_keeps_five_newest_and_preserves_previous_results():
+    previous_path=app.DB_PATH
+    with tempfile.TemporaryDirectory() as temp:
+        app.DB_PATH=Path(temp)/'fifo.db'
+        try:
+            app.init_db()
+            levels={'entry':100,'stop':95,'tp1':105,'tp2':110,'tp3':115}
+            asset={'direction':'LONG CANDIDATE','levels':levels,'price':100,'bias':50,'timing':60,
+                   'signal_score':70,'setup_trigger':'15M MOMENTUM CONTINUATION'}
+            # Simulate successive qualifying 15M signals without waiting in real time.
+            from datetime import timedelta
+            for i in range(6):
+                asset['signal_candle_ts']=1700000000000+i*900000
+                with sqlite3.connect(app.DB_PATH) as db:
+                    db.execute("UPDATE signals SET ts=? WHERE symbol='BTCUSDT'",
+                               ((datetime.now(timezone.utc)-timedelta(minutes=20)).isoformat(),))
+                rows=app.record_signal_log('BTCUSDT',asset,'LONG CANDIDATE')
+                assert len(rows)==min(i+1,5)
+            assert [r['candle_ts'] for r in rows]==[1700000000000+i*900000 for i in (5,4,3,2,1)]
         finally:
             app.DB_PATH=previous_path
 

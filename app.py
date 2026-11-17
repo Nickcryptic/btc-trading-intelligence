@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.8.1'
+STRATEGY_VERSION = '0.8.2'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -47,6 +47,11 @@ def init_db():
                             ('observation_source','TEXT'),('coverage','TEXT'),('verification_note','TEXT')):
             if column not in columns:
                 db.execute(f'ALTER TABLE signals ADD COLUMN {column} {kind}')
+        # Only current-model paper signals belong in the five-entry FIFO journal.
+        # Retire pre-v0.8.2 rows, including LEGACY rows, without re-importing them.
+        db.execute('DELETE FROM signals WHERE COALESCE(strategy_version,\'LEGACY\') != ?', (STRATEGY_VERSION,))
+        for symbol in SYMBOLS:
+            db.execute('DELETE FROM signals WHERE symbol=? AND id NOT IN (SELECT id FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5)',(symbol,symbol))
         db.execute('CREATE TABLE IF NOT EXISTS wintermute (id INTEGER PRIMARY KEY, ts TEXT, signal TEXT, note TEXT)')
 
 
@@ -443,11 +448,11 @@ def reconcile_signal(row, candles, source='Exchange spot · 1M OHLC'):
 
 
 def record_signal_log(symbol, asset, previous_direction, candles=None):
-    """Only journal actual paper candidates, at most once per side per hour."""
+    """Five newest distinct paper entries per asset, FIFO; preserve their outcomes."""
     now=datetime.now(timezone.utc)
     with sqlite3.connect(DB_PATH) as db:
         db.row_factory=sqlite3.Row
-        existing=list(db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 50',(symbol,)))
+        existing=list(db.execute('SELECT * FROM signals WHERE symbol=? AND strategy_version=? ORDER BY id DESC LIMIT 5',(symbol,STRATEGY_VERSION)))
         for row in existing:
             observed=reconcile_signal(row,candles,asset.get('observation_source','Exchange spot · 1M OHLC'))
             db.execute('''UPDATE signals SET status=?,checked_until_ms=?,observed_at=?,
@@ -459,15 +464,19 @@ def record_signal_log(symbol, asset, previous_direction, candles=None):
         levels=asset['levels']
         if levels and direction in ('LONG CANDIDATE','SHORT CANDIDATE'):
             last=existing[0] if existing else None
-            elapsed=(now-datetime.fromisoformat(last['ts'])).total_seconds() if last else float('inf')
             side='LONG' if direction.startswith('LONG') else 'SHORT'
-            same_candle=last and last['strategy_version']==STRATEGY_VERSION and last['side']==side and last['candle_ts']==asset.get('signal_candle_ts')
-            distinct=not last or last['side']!=side or last['strategy_version']!=STRATEGY_VERSION
-            if not same_candle and (distinct and (not last or elapsed>=120) or elapsed>=3600):
+            candle_ts=asset.get('signal_candle_ts')
+            # One signal per completed 15M trigger candle, never repeated by 2M polling.
+            # Each subsequent qualifying candle can create a new journal entry.
+            seen=bool(candle_ts is not None and any(row['candle_ts']==candle_ts for row in existing))
+            elapsed=(now-datetime.fromisoformat(last['ts'])).total_seconds() if last else float('inf')
+            if not seen and elapsed>=14*60:
                 db.execute('INSERT INTO signals(ts,symbol,side,entry,stop,tp1,tp2,tp3,bias,timing,status,strategy_version,candle_ts,model_score,setup_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                            (now.isoformat(),symbol,side,levels['entry'],levels['stop'],
                             levels['tp1'],levels['tp2'],levels['tp3'],asset['bias'],asset['timing'],
-                            'TRACKING',STRATEGY_VERSION,asset.get('signal_candle_ts'),asset.get('signal_score'),asset.get('setup_trigger')))
+                            'TRACKING',STRATEGY_VERSION,candle_ts,asset.get('signal_score'),asset.get('setup_trigger')))
+        # FIFO: newest five remain, oldest removed only when a sixth is inserted.
+        db.execute('DELETE FROM signals WHERE symbol=? AND id NOT IN (SELECT id FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5)',(symbol,symbol))
         return [dict(row) for row in db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5',(symbol,))]
 
 
@@ -734,6 +743,11 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
     daily=sign(vd[-1]>ma200,vd[-1]<ma200)
     cross=sign(ma50>ma200,ma50<ma200)
     hour_move=sign(v1[-1]>v1[-5],v1[-1]<v1[-5])
+    # A run of completed hourly candles against the 4H trend is a live reversal
+    # warning: never keep issuing counter-momentum entries just because 4H/1D lag.
+    green_hour=sum(c['close']>c['open'] for c in c1[-6:])
+    red_hour=sum(c['close']<c['open'] for c in c1[-6:])
+    hourly_reversal=1 if green_hour>=4 and v1[-1]>v1[-5] else -1 if red_hour>=4 and v1[-1]<v1[-5] else 0
     rsi_direction=sign(50<=r15<78,22<r15<=50)
     result.update({'bias':60*four+25*daily+15*cross,
                    'timing':45*hour+30*fifteen+15*hour_move+10*rsi_direction,
@@ -767,6 +781,7 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
         rsi_ok=(40<=r15<=78 if side==1 else 18<=r15<=60)
         pts=(25 if four==side else 0)+(25 if hour==side else 0)
         pts+=(15 if fifteen==side else 0)
+        pts+=15 if hourly_reversal==side else 0
         pts+=(15 if p in ('15M BREAKOUT','15M BREAKDOWN','15M PULLBACK / RECLAIM','15M PULLBACK / REJECTION')
               else 10 if p!='NONE' else 0)
         pts+=10 if rsi_ok and momentum_ok else 5 if rsi_ok or momentum_ok else 0
@@ -776,6 +791,11 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
 
     long_score,long_pattern=score(1)
     short_score,short_pattern=score(-1)
+    # Do not prefer an old bearish regime over a clear six-hour bullish reversal.
+    if hourly_reversal==1:
+        short_score=max(0,short_score-35)
+    elif hourly_reversal==-1:
+        long_score=max(0,long_score-35)
     side=1 if long_score>short_score else -1
     points=max(long_score,short_score)
     trigger=long_pattern if side==1 else short_pattern
@@ -787,7 +807,9 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
         return result
 
     # Safety checks are vetoes; volume and a perfect 1D alignment are not.
-    anchor=(hour==side or (four==side and fifteen==side))
+    anchor=(hour==side or (four==side and fifteen==side) or
+            (hourly_reversal==side and fifteen==side))
+    counter_hourly_reversal=hourly_reversal==-side
     volatility=0.06<=a/price*100<=2.8
     spread_ok=spread is not None and math.isfinite(spread) and 0<=spread<=5
     not_chasing=abs(price-last['close'])<=1.6*a and abs(price-e21)<=3.8*a
@@ -814,7 +836,7 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
     watch=plan(watch_entry)
     active=plan(price)
     risk_ok=active is not None
-    required_ok=anchor and spread_ok and volatility and not_chasing and not_exhausted and risk_ok
+    required_ok=anchor and not counter_hourly_reversal and spread_ok and volatility and not_chasing and not_exhausted and risk_ok
     checks=[
         {'label':'4H trend', 'ok':four==side,'detail':'ALIGNED' if four==side else 'COUNTERTREND'},
         {'label':'1H execution trend','ok':hour==side,'detail':'ALIGNED' if hour==side else 'MIXED'},
@@ -834,6 +856,7 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
     else:
         blockers=[]
         if not anchor:blockers.append('1H/4H anchor not yet aligned')
+        if counter_hourly_reversal:blockers.append('last six completed 1H candles oppose this trade')
         if points<65:blockers.append(f'evidence {points}/100, needs 65')
         if trigger=='NONE':blockers.append('no recent 15M continuation/reclaim')
         if not (spread_ok and volatility and not_chasing and not_exhausted):blockers.append('spread / volatility / chase filter')
