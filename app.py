@@ -404,7 +404,7 @@ def reconcile_signal(row, candles, source='Exchange spot · 1M OHLC'):
     if cursor<bars[0]['ts']:
         gap=True
         cursor=bars[0]['ts']
-    if not result.get('checked_until_ms') and not gap:
+    if not result.get('checked_until_ms') and not gap and status=='TRACKING':
         # Legacy TP1/TP2 sampled milestones can be replayed accurately only
         # when the full post-issuance minute sequence is still available.
         status='TRACKING'
@@ -417,19 +417,20 @@ def reconcile_signal(row, candles, source='Exchange spot · 1M OHLC'):
         high,low=candle['high'],candle['low']
         long=result['side']=='LONG'
         entry_hit=low<=result['entry']<=high
+        newly_activated=not activated and entry_hit
         if not activated:
             if not entry_hit:
                 status='PENDING ENTRY'
                 cursor=start+60000
                 continue
             activated=True
-            status='TRACKING'
+            status='ENTRY SEEN'
         stop_hit=low<=result['stop'] if long else high>=result['stop']
         targets=[i for i in (1,2,3) if (high>=result[f'tp{i}'] if long else low<=result[f'tp{i}'])]
         reached=max(targets,default=0)
         known=int(status[2]) if status.startswith('TP') and status[2].isdigit() else 0
         next_status=status
-        if entry_hit and (stop_hit or reached>known) and known==0:
+        if newly_activated and (stop_hit or reached>known) and known==0:
             next_status='AMBIGUOUS SL/TP'
         elif stop_hit and reached>known:
             next_status='AMBIGUOUS SL/TP'
