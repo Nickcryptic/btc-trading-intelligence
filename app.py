@@ -25,7 +25,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.8.6'
+STRATEGY_VERSION = '0.8.7'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1179,6 +1179,29 @@ app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 
 @app.get('/')
 async def index(): return FileResponse(ROOT/'static'/'index.html',headers={'Cache-Control':'no-store, max-age=0, must-revalidate'})
+
+@app.get('/api/futures-feed-check')
+async def futures_feed_check():
+    """Read-only reachability check from the actual Render host; no fallback to spot."""
+    endpoints = {
+        'binance_usdm_last': 'https://fapi.binance.com/fapi/v1/ticker/price',
+        'binance_usdm_mark': 'https://fapi.binance.com/fapi/v1/premiumIndex',
+        'binance_usdm_candles': 'https://fapi.binance.com/fapi/v1/klines',
+        'binance_usdm_alternate': 'https://fapi1.binance.com/fapi/v1/ticker/price',
+    }
+    results = {}
+    async with httpx.AsyncClient(timeout=6) as client:
+        for name,url in endpoints.items():
+            try:
+                params={'symbol':'BTCUSDT'}
+                if name=='binance_usdm_candles':
+                    params.update(interval='1m',limit=2)
+                response=await client.get(url,params=params)
+                results[name]={'reachable':response.status_code==200,'http_status':response.status_code}
+            except httpx.HTTPError as exc:
+                results[name]={'reachable':False,'error':type(exc).__name__}
+    return {'version':STRATEGY_VERSION,'results':results}
+
 
 @app.get('/api/health')
 async def health(): return {'ok':True,'version':STATE['version'],'updated':STATE['updated'],'assets_live':list(STATE['assets'])}
