@@ -23,7 +23,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.8.3'
+STRATEGY_VERSION = '0.8.4'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -391,7 +391,8 @@ def reconcile_signal(row, candles, source='Exchange spot · 1M OHLC'):
     first_full_minute=((issued_ms+59999)//60000)*60000
     cursor=max(first_full_minute,int(result.get('checked_until_ms') or first_full_minute))
     gap=result.get('coverage')=='GAP'
-    status='TRACKING' if result['status']=='EXPIRED / UNRESOLVED' else result['status']
+    status='PENDING ENTRY' if result['status']=='EXPIRED / UNRESOLVED' else result['status']
+    activated=status not in ('TRACKING','PENDING ENTRY')
     if not candles:
         result.update(coverage='GAP' if gap else 'FEED UNAVAILABLE',
                       verification_note='1-minute candles unavailable; results are not verified.')
@@ -415,12 +416,22 @@ def reconcile_signal(row, candles, source='Exchange spot · 1M OHLC'):
             gap=True
         high,low=candle['high'],candle['low']
         long=result['side']=='LONG'
+        entry_hit=low<=result['entry']<=high
+        if not activated:
+            if not entry_hit:
+                status='PENDING ENTRY'
+                cursor=start+60000
+                continue
+            activated=True
+            status='TRACKING'
         stop_hit=low<=result['stop'] if long else high>=result['stop']
         targets=[i for i in (1,2,3) if (high>=result[f'tp{i}'] if long else low<=result[f'tp{i}'])]
         reached=max(targets,default=0)
         known=int(status[2]) if status.startswith('TP') and status[2].isdigit() else 0
         next_status=status
-        if stop_hit and reached>known:
+        if entry_hit and (stop_hit or reached>known) and known==0:
+            next_status='AMBIGUOUS SL/TP'
+        elif stop_hit and reached>known:
             next_status='AMBIGUOUS SL/TP'
         elif stop_hit:
             next_status='SL AFTER TP2' if known>=2 else 'SL AFTER TP1' if known>=1 else 'SL SEEN'
@@ -469,12 +480,12 @@ def record_signal_log(symbol, asset, previous_direction, candles=None):
             # One signal per completed 15M trigger candle, never repeated by 2M polling.
             # Each subsequent qualifying candle can create a new journal entry.
             seen=bool(candle_ts is not None and any(row['candle_ts']==candle_ts for row in existing))
-            elapsed=(now-datetime.fromisoformat(last['ts'])).total_seconds() if last else float('inf')
-            if not seen and elapsed>=14*60:
+            # No time-based cooldown: new qualifying candle may trigger immediately.
+            if not seen:
                 db.execute('INSERT INTO signals(ts,symbol,side,entry,stop,tp1,tp2,tp3,bias,timing,status,strategy_version,candle_ts,model_score,setup_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                            (now.isoformat(),symbol,side,levels['entry'],levels['stop'],
                             levels['tp1'],levels['tp2'],levels['tp3'],asset['bias'],asset['timing'],
-                            'TRACKING',STRATEGY_VERSION,candle_ts,asset.get('signal_score'),asset.get('setup_trigger')))
+                            'PENDING ENTRY',STRATEGY_VERSION,candle_ts,asset.get('signal_score'),asset.get('setup_trigger')))
         # FIFO: newest five remain, oldest removed only when a sixth is inserted.
         db.execute('DELETE FROM signals WHERE symbol=? AND id NOT IN (SELECT id FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5)',(symbol,symbol))
         return [dict(row) for row in db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5',(symbol,))]
@@ -588,7 +599,7 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
     change15=(c15[-2]/c15[-3]-1)*100 if len(c15)>3 else None
     support=min(x['low'] for x in k1h[-26:-1]); resistance=max(x['high'] for x in k1h[-26:-1]);
     structure_targets=structure_liquidity_targets(k1h,k4h,price)
-    decision=professional_decision(k15,k1h,k4h,kd,price,spread,structure_targets)
+    decision=professional_decision(k15,k1h,k4h,kd,price,spread,structure_targets,imbalance,trade_imbalance)
     bias=decision['bias']; timing=decision['timing']
     direction=decision['direction']; levels=decision['levels']
     zones_by_timeframe={
@@ -711,7 +722,7 @@ def build_broad_liquidity(payload,symbol,fallback_book,price,fallback_source):
     return wide_liquidity_snapshot(fallback_book,price,fallback_source,'USD')
 
 
-def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
+def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=None,trade_imbalance=None):
     """Adaptive, *unvalidated* trend/pullback model; points are evidence, not win odds.
 
     Only completed 15M/1H/4H/1D candles influence direction; the live quote
@@ -806,9 +817,14 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
         result['reason']='No directional edge: trend and momentum scores are mixed.'
         return result
 
+    # Order-book snapshots are supporting evidence, not standalone signals.
+    flow_support=(imbalance is not None and trade_imbalance is not None and imbalance*side>=0.08 and trade_imbalance*side>=0.08)
+    flow_opposes=(imbalance is not None and trade_imbalance is not None and imbalance*side < -0.18 and trade_imbalance*side < -0.18)
+    structure_break=(last['close']>max(c['high'] for c in c15[-5:-1]) if side==1 else last['close']<min(c['low'] for c in c15[-5:-1]))
+    pattern_confirmed=trigger!='NONE' and (structure_break or flow_support or ratio>=1.15)
+    reversal_confirmed=hourly_reversal==side and fifteen==side and (structure_break or flow_support)
+    anchor=(hour==side and (four==side or fifteen==side)) or reversal_confirmed
     # Safety checks are vetoes; volume and a perfect 1D alignment are not.
-    anchor=(hour==side or (four==side and fifteen==side) or
-            (hourly_reversal==side and fifteen==side))
     counter_hourly_reversal=hourly_reversal==-side
     volatility=0.06<=a/price*100<=2.8
     spread_ok=spread is not None and math.isfinite(spread) and 0<=spread<=5
@@ -836,7 +852,7 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
     watch=plan(watch_entry)
     active=plan(price)
     risk_ok=active is not None
-    required_ok=anchor and not counter_hourly_reversal and spread_ok and volatility and not_chasing and not_exhausted and risk_ok
+    required_ok=anchor and pattern_confirmed and not flow_opposes and not counter_hourly_reversal and spread_ok and volatility and not_chasing and not_exhausted and risk_ok
     checks=[
         {'label':'4H trend', 'ok':four==side,'detail':'ALIGNED' if four==side else 'COUNTERTREND'},
         {'label':'1H execution trend','ok':hour==side,'detail':'ALIGNED' if hour==side else 'MIXED'},
@@ -847,9 +863,10 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
         {'label':'Stop geometry','ok':risk_ok,'detail':f'{active["risk_pct"]:.2f}% risk' if active else 'TOO WIDE / TIGHT'}]
     result['checks']=checks
     result['trigger_price']=round(watch_entry,2)
+    result['checks'].append({'label':'Price / order flow','ok':pattern_confirmed and not flow_opposes,'detail':'CONFIRMED' if pattern_confirmed and not flow_opposes else 'WAIT'})
     result['watch_direction']='LONG' if side==1 else 'SHORT'
     result['watch_levels']=watch
-    if required_ok and points>=65 and trigger!='NONE':
+    if required_ok and points>=65:
         result.update({'direction':'LONG CANDIDATE' if side==1 else 'SHORT CANDIDATE',
                        'levels':active,
                        'reason':f'{points}/100 evidence · {trigger.lower()} · {active["risk_pct"]:.2f}% defined stop. Paper signal, not a verified edge.'})
@@ -858,7 +875,8 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None):
         if not anchor:blockers.append('1H/4H anchor not yet aligned')
         if counter_hourly_reversal:blockers.append('last six completed 1H candles oppose this trade')
         if points<65:blockers.append(f'evidence {points}/100, needs 65')
-        if trigger=='NONE':blockers.append('no recent 15M continuation/reclaim')
+        if not pattern_confirmed:blockers.append('price/volume or order-flow confirmation missing')
+        if flow_opposes:blockers.append('order flow opposes this trade')
         if not (spread_ok and volatility and not_chasing and not_exhausted):blockers.append('spread / volatility / chase filter')
         if not risk_ok:blockers.append('stop geometry')
         result['reason']=f'Conditional {result["watch_direction"]} above/below ${watch_entry:,.2f}; waiting: '+', '.join(blockers)+'.'
