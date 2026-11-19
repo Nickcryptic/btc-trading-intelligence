@@ -1,3 +1,15 @@
+# BTC / ETH Market Intelligence — v0.8.6
+
+## Persistent signal journal setup (required on Render)
+The app supports PostgreSQL when `DATABASE_URL` is configured. Provision a persistent PostgreSQL database separately (Render Postgres or a compatible provider), and add its **internal connection URL** as the secret environment variable `DATABASE_URL` on the Render web service. Redeploy the web service. Never put database credentials in GitHub. Without `DATABASE_URL`, the free Render service continues using ephemeral SQLite under `/tmp`, which can lose signals on restart. Persistent PostgreSQL may incur provider charges; no paid database is provisioned by this repository.
+
+The journal keeps the newest five signals per asset, including v0.8.5 entries already present in the selected server database, and their observed TP/SL outcomes. It cannot migrate entries from a deleted ephemeral database. The laptop's existing v0.8.5 browser-local cache is preserved for possible manual recovery. Browser-only records are not automatically trusted as authenticated server-issued signals.
+
+## Release note
+v0.8.6 changes journal storage only. Paper signals are unvalidated research; no live order fills are verified.
+
+---
+
 # BTC / ETH Market Intelligence — v0.8.1
 
 **Status: unvalidated research / paper-signal dashboard, not an established profitable strategy.** v0.8.1 improves observable result tracking and adds source freshness per indicator. No guaranteed profitable prediction, actual fills, Telegram alert or brokerage execution is provided. BTC/ETH near-market data comes from Kraken spot (or Binance when accessible). The independent short-term liquidity pressure monitor remains outside all trade-scoring decisions.
