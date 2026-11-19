@@ -23,10 +23,11 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.8.4'
+STRATEGY_VERSION = '0.8.5'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
+REPLAY_CACHE = {}
 
 
 def init_db():
@@ -678,7 +679,18 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
             indicator['source_as_of']=datetime.fromtimestamp(max(valid_trade_times),timezone.utc).isoformat()
         else:
             indicator['source_as_of']=None
-    replay=replay_recent_candles(k15,k1h,k4h,kd)
+    # Recompute costly historical replay only on a new completed 15M candle.
+    replay_key=(symbol,k15[-2]['ts'])
+    cached=REPLAY_CACHE.get(symbol)
+    if cached and cached['key']==replay_key:
+        replay=cached['result']
+    else:
+        try:
+            replay=replay_recent_candles(k15,k1h,k4h,kd)
+        except Exception:
+            LOG.exception('Historical replay failed for %s',symbol)
+            replay={'status':'UNAVAILABLE','trades':0,'note':'Historical replay unavailable; live feed unaffected.'}
+        REPLAY_CACHE[symbol]={'key':replay_key,'result':replay}
     return {'symbol':symbol,'market_source':spot_source,'market_pair':market_pair or symbol,'price':round(price,2),'change24h':round(float(ticker['priceChangePercent']),2),'bias':bias,'timing':timing,'bias_label':score_label(bias),'timing_label':score_label(timing),'direction':direction,'test_confirmation':direction!='NO TRADE','levels':levels,'signal_checks':decision['checks'],'signal_score':decision['signal_score'],'signal_grade':decision['signal_grade'],'signal_candle_ts':decision['signal_candle_ts'],'watch_direction':decision['watch_direction'],'watch_levels':decision['watch_levels'],'trigger_price':decision['trigger_price'],'setup_reason':decision['reason'],'setup_trigger':decision['trigger'],'setup_volume_ratio':decision['volume_ratio'],'model_replay':replay,'structure_targets':structure_targets,'indicators':indicators,'fvg':zones,'fvg_by_timeframe':zones_by_timeframe,'order_book':order_book_snapshot(book,price),'recent_tape':recent_tape_snapshot(trades),'support':round(support,2),'resistance':round(resistance,2),'rsi15':rsi15,'spread_bps':round(spread,2) if spread is not None else None,'imbalance':round(imbalance*100,1) if imbalance is not None else None,'data_status':'PARTIAL — unconnected sources are excluded','updated':datetime.now(timezone.utc).isoformat(),'confirmed':False,'confirmation_reason':'Weighted 1D/4H/1H/15M evidence and explicit safety vetoes evaluated live; no validated profitability or fill guarantee.'}
 
 
@@ -808,6 +820,9 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=Non
         short_score=max(0,short_score-35)
     elif hourly_reversal==-1:
         long_score=max(0,long_score-35)
+    if long_score==short_score:
+        result['reason']='LONG and SHORT scores tied; no directional edge.'
+        return result
     side=1 if long_score>short_score else -1
     points=max(long_score,short_score)
     trigger=long_pattern if side==1 else short_pattern
@@ -1079,9 +1094,11 @@ async def refresh():
 
 async def loop():
     while True:
+        started=asyncio.get_running_loop().time()
         try: await refresh()
         except Exception: LOG.exception('Refresh error')
-        await asyncio.sleep(120)
+        elapsed=asyncio.get_running_loop().time()-started
+        await asyncio.sleep(max(1,120-elapsed))
 
 
 async def wintermute_loop():
