@@ -201,12 +201,12 @@ function renderLiquidity(asset,stale){
 try {
   for(let i=localStorage.length-1;i>=0;i--){
     const key=localStorage.key(i);
-    if(key&&key.startsWith('btc-intel-signal-journal-')&&!key.startsWith('btc-intel-signal-journal-v083-'))
+    if(key&&key.startsWith('btc-intel-signal-journal-')&&!key.startsWith('btc-intel-signal-journal-v084-'))
       localStorage.removeItem(key);
   }
 }catch{/* private browsing */}
-const journalKey = symbol => 'btc-intel-signal-journal-v083-'+symbol;
-const currentJournalVersion = '0.8.3';
+const journalKey = symbol => 'btc-intel-signal-journal-v084-'+symbol;
+const currentJournalVersion = '0.8.4';
 const signalId = row => String(row.ts)+'|'+String(row.entry)+'|'+String(row.side);
 function cachedSignalRows(symbol){
   let cached=[];
