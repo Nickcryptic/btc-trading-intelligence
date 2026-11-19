@@ -498,7 +498,7 @@ def record_signal_log(symbol, asset, previous_direction, candles=None):
     now=datetime.now(timezone.utc)
     with open_db() as db:
         db.row_factory=sqlite3.Row
-        existing=list(db.execute('SELECT * FROM signals WHERE symbol=? AND strategy_version=? ORDER BY id DESC LIMIT 5',(symbol,STRATEGY_VERSION)))
+        existing=list(db.execute("SELECT * FROM signals WHERE symbol=? AND strategy_version IN ('0.8.5','0.8.6') ORDER BY id DESC LIMIT 5",(symbol,)))
         for row in existing:
             observed=reconcile_signal(row,candles,asset.get('observation_source','Exchange spot · 1M OHLC'))
             db.execute('''UPDATE signals SET status=?,checked_until_ms=?,observed_at=?,
@@ -1192,7 +1192,7 @@ async def state():
             for row in rows:
                 row.pop('book_snapshot',None)
         # Never expose migrated legacy rows, including any stale in-memory snapshot.
-        data['signal_log']={symbol:[row for row in rows if row.get('strategy_version')==STRATEGY_VERSION][:5]
+        data['signal_log']={symbol:[row for row in rows if row.get('strategy_version') in ('0.8.5','0.8.6')][:5]
                             for symbol,rows in data['signal_log'].items()}
         return JSONResponse(data,headers={'Cache-Control':'no-store, max-age=0'})
 
