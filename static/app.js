@@ -201,12 +201,12 @@ function renderLiquidity(asset,stale){
 try {
   for(let i=localStorage.length-1;i>=0;i--){
     const key=localStorage.key(i);
-    if(key&&key.startsWith('btc-intel-signal-journal-')&&!key.startsWith('btc-intel-signal-journal-v084-'))
+    if(key&&key.startsWith('btc-intel-signal-journal-')&&!key.startsWith('btc-intel-signal-journal-v085-'))
       localStorage.removeItem(key);
   }
 }catch{/* private browsing */}
-const journalKey = symbol => 'btc-intel-signal-journal-v084-'+symbol;
-const currentJournalVersion = '0.8.4';
+const journalKey = symbol => 'btc-intel-signal-journal-v085-'+symbol;
+const currentJournalVersion = '0.8.5';
 const signalId = row => String(row.ts)+'|'+String(row.entry)+'|'+String(row.side);
 function cachedSignalRows(symbol){
   let cached=[];
@@ -332,4 +332,5 @@ document.querySelectorAll('[data-fvg-tf]').forEach(button=>button.addEventListen
 }));
 $('reload').addEventListener('click',load);
 load();
-setInterval(load,120000);
+setInterval(()=>{if(!document.hidden)load()},120000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)load()});
