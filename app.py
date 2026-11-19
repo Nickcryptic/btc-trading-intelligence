@@ -25,7 +25,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.8.7'
+STRATEGY_VERSION = '0.8.8'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1125,6 +1125,23 @@ async def refresh():
         STATE['updated']=datetime.now(timezone.utc).isoformat()
 
 
+async def log_binance_futures_connectivity():
+    """Run once on Render, report only HTTP statuses (never credentials)."""
+    async with httpx.AsyncClient(timeout=7) as client:
+        for endpoint in ('ticker/price','premiumIndex','klines'):
+            params={'symbol':'BTCUSDT'}
+            if endpoint=='klines':
+                params.update(interval='1m',limit=2)
+            for host in ('https://fapi.binance.com','https://fapi1.binance.com'):
+                try:
+                    response=await client.get(host+'/fapi/v1/'+endpoint,params=params)
+                    LOG.warning('BINANCE_FUTURES_CHECK host=%s endpoint=%s status=%s',
+                                host,endpoint,response.status_code)
+                except httpx.HTTPError as exc:
+                    LOG.warning('BINANCE_FUTURES_CHECK host=%s endpoint=%s error=%s',
+                                host,endpoint,type(exc).__name__)
+
+
 async def loop():
     while True:
         started=asyncio.get_running_loop().time()
@@ -1148,6 +1165,7 @@ async def wintermute_loop():
 @asynccontextmanager
 async def lifespan(app):
     init_db()
+    asyncio.create_task(log_binance_futures_connectivity())
     task=asyncio.create_task(loop())
     wintermute_task=asyncio.create_task(wintermute_loop())
     yield
