@@ -25,7 +25,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.8.8'
+STRATEGY_VERSION = '0.8.9'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1125,6 +1125,29 @@ async def refresh():
         STATE['updated']=datetime.now(timezone.utc).isoformat()
 
 
+async def log_kraken_futures_connectivity():
+    """Verify Kraken Futures public endpoints from the actual Render host."""
+    endpoints = [
+        ('instruments','https://futures.kraken.com/derivatives/api/v3/instruments',None),
+        ('tickers','https://futures.kraken.com/derivatives/api/v3/tickers',None),
+        ('btc_history','https://futures.kraken.com/api/charts/v1/trade/PF_XBTUSD/1m',{'from':int(time.time())-300}),
+        ('eth_history','https://futures.kraken.com/api/charts/v1/trade/PF_ETHUSD/1m',{'from':int(time.time())-300}),
+    ]
+    async with httpx.AsyncClient(timeout=9) as client:
+        for name,url,params in endpoints:
+            try:
+                response=await client.get(url,params=params)
+                LOG.warning('KRAKEN_FUTURES_CHECK endpoint=%s status=%s content_type=%s',
+                            name,response.status_code,response.headers.get('content-type','')[:40])
+                if response.status_code==200 and name in ('instruments','tickers'):
+                    payload=response.json()
+                    rows=payload.get('instruments' if name=='instruments' else 'tickers',[])
+                    matched=[x.get('symbol') for x in rows if x.get('symbol') in ('PF_XBTUSD','PF_ETHUSD')]
+                    LOG.warning('KRAKEN_FUTURES_CHECK endpoint=%s contracts=%s',name,','.join(matched))
+            except (httpx.HTTPError,ValueError,TypeError) as exc:
+                LOG.warning('KRAKEN_FUTURES_CHECK endpoint=%s error=%s',name,type(exc).__name__)
+
+
 async def log_binance_futures_connectivity():
     """Run once on Render, report only HTTP statuses (never credentials)."""
     async with httpx.AsyncClient(timeout=7) as client:
@@ -1165,7 +1188,7 @@ async def wintermute_loop():
 @asynccontextmanager
 async def lifespan(app):
     init_db()
-    asyncio.create_task(log_binance_futures_connectivity())
+    asyncio.create_task(log_kraken_futures_connectivity())
     task=asyncio.create_task(loop())
     wintermute_task=asyncio.create_task(wintermute_loop())
     yield
