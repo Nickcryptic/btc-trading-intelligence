@@ -238,7 +238,7 @@ async function reconcileBrowserHistory(){
     let checked=[];
     try{
       const response=await fetch('/api/reconcile-cached-signals',{
-        method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',
+        method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',signal:AbortSignal.timeout(12000),
         body:JSON.stringify({symbol,rows:orphan})
       });
       if(!response.ok)throw new Error('Verification feed unavailable');
@@ -298,7 +298,7 @@ async function load(){
     const response=await fetch('/api/state',{cache:'no-store'});
     if(!response.ok)throw new Error('Server '+response.status);
     current=await response.json();
-    await reconcileBrowserHistory();
+    // Do not block live feed display on slow historical reconciliation.
     const asset=current.assets?.[selected];
     $('updated').textContent=shortTime(asset?.updated||current.updated);
     $('updated-mini').textContent='Updated '+londonTime(asset?.updated);
@@ -313,6 +313,7 @@ async function load(){
       renderLiquidity(null,true);
     }
     renderHistory();
+    reconcileBrowserHistory().then(()=>renderSignalLog()).catch(()=>{});
   }catch(error){
     $('connection').textContent='● CONNECTION ERROR';
     $('connection').className='live-badge stale';
