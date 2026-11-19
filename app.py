@@ -5,6 +5,8 @@ import logging
 import math
 import os
 import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 import time
 from statistics import median
 from contextlib import asynccontextmanager
@@ -23,19 +25,49 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.8.5'
+STRATEGY_VERSION = '0.8.6'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
 REPLAY_CACHE = {}
 
 
+class DatabaseConnection:
+    """SQLite for local development; PostgreSQL for durable Render storage."""
+    def __init__(self):
+        self.pg=bool(os.getenv('DATABASE_URL'))
+        self.connection=(psycopg.connect(os.environ['DATABASE_URL'],row_factory=dict_row)
+                         if self.pg else sqlite3.connect(DB_PATH))
+    def __enter__(self):
+        self.connection.__enter__()
+        return self
+    def __exit__(self,*args):
+        return self.connection.__exit__(*args)
+    @property
+    def row_factory(self):
+        return None
+    @row_factory.setter
+    def row_factory(self,value):
+        if not self.pg:
+            self.connection.row_factory=value
+    def execute(self,sql,params=()):
+        if self.pg:
+            sql=sql.replace('?', '%s')
+        return self.connection.execute(sql,params)
+
+
+def open_db():
+    return DatabaseConnection()
+
+
 def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as db:
-        db.execute('CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY, ts TEXT, symbol TEXT, side TEXT, entry REAL, stop REAL, tp1 REAL, tp2 REAL, tp3 REAL, bias REAL, timing REAL, status TEXT)')
+    if not os.getenv('DATABASE_URL'):
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LOG.warning('Journal is using ephemeral SQLite. Configure DATABASE_URL for cross-device persistence.')
+    with open_db() as db:
+        db.execute('CREATE TABLE IF NOT EXISTS signals (id '+('BIGSERIAL PRIMARY KEY' if db.pg else 'INTEGER PRIMARY KEY')+', ts TEXT, symbol TEXT, side TEXT, entry REAL, stop REAL, tp1 REAL, tp2 REAL, tp3 REAL, bias REAL, timing REAL, status TEXT)')
         # Keep old paper entries intact while distinguishing the new strategy.
-        columns={row[1] for row in db.execute('PRAGMA table_info(signals)')}
+        columns=({row['column_name'] for row in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='signals'")} if db.pg else {row[1] for row in db.execute('PRAGMA table_info(signals)')})
         if 'strategy_version' not in columns:
             db.execute("ALTER TABLE signals ADD COLUMN strategy_version TEXT DEFAULT 'LEGACY'")
         if 'candle_ts' not in columns:
@@ -50,16 +82,17 @@ def init_db():
                 db.execute(f'ALTER TABLE signals ADD COLUMN {column} {kind}')
         # Only current-model paper signals belong in the five-entry FIFO journal.
         # Retire pre-v0.8.2 rows, including LEGACY rows, without re-importing them.
-        db.execute('DELETE FROM signals WHERE COALESCE(strategy_version,\'LEGACY\') != ?', (STRATEGY_VERSION,))
+        # Preserve prior versions across releases; the UI filters to the current version.
+        # Old rows are pruned by the per-asset five-entry FIFO below.
         for symbol in SYMBOLS:
             db.execute('DELETE FROM signals WHERE symbol=? AND id NOT IN (SELECT id FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5)',(symbol,symbol))
-        db.execute('CREATE TABLE IF NOT EXISTS wintermute (id INTEGER PRIMARY KEY, ts TEXT, signal TEXT, note TEXT)')
+        db.execute('CREATE TABLE IF NOT EXISTS wintermute (id '+('BIGSERIAL PRIMARY KEY' if db.pg else 'INTEGER PRIMARY KEY')+', ts TEXT, signal TEXT, note TEXT)')
 
 
 def record_wintermute_unavailable():
     """An observation is NOT a buy/sell classification when no wallet feed exists."""
     now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(DB_PATH) as db:
+    with open_db() as db:
         db.execute('INSERT INTO wintermute(ts, signal, note) VALUES (?, ?, ?)',
                    (now, 'UNAVAILABLE', 'Verified attributed wallet/order feed not connected'))
         db.execute('DELETE FROM wintermute WHERE id NOT IN (SELECT id FROM wintermute ORDER BY id DESC LIMIT 10)')
@@ -463,7 +496,7 @@ def reconcile_signal(row, candles, source='Exchange spot · 1M OHLC'):
 def record_signal_log(symbol, asset, previous_direction, candles=None):
     """Five newest distinct paper entries per asset, FIFO; preserve their outcomes."""
     now=datetime.now(timezone.utc)
-    with sqlite3.connect(DB_PATH) as db:
+    with open_db() as db:
         db.row_factory=sqlite3.Row
         existing=list(db.execute('SELECT * FROM signals WHERE symbol=? AND strategy_version=? ORDER BY id DESC LIMIT 5',(symbol,STRATEGY_VERSION)))
         for row in existing:
@@ -1202,7 +1235,7 @@ async def reconcile_cached_signals(request: Request):
 
 @app.get('/api/signals')
 async def signals():
-    with sqlite3.connect(DB_PATH) as db:
+    with open_db() as db:
         db.row_factory=sqlite3.Row
         return {'signals':[dict(r) for r in db.execute('SELECT * FROM signals ORDER BY id DESC LIMIT 50')]}
 
