@@ -293,6 +293,94 @@ function renderAsset(asset){
   renderCoverage(asset);
   renderSignalLog();
 }
+
+let selectedEtf='BTC';
+const etfFlowFormat = v => typeof v==='number' && Number.isFinite(v) ? (v>0?'+':'')+'
+  try{
+    const response=await fetch('/api/state',{cache:'no-store'});
+    if(!response.ok)throw new Error('Server '+response.status);
+    current=await response.json();
+    // Do not block live feed display on slow historical reconciliation.
+    const asset=current.assets?.[selected];
+    $('updated').textContent=shortTime(asset?.updated||current.updated);
+    $('updated-mini').textContent='Updated '+londonTime(asset?.updated);
+    const stale=asset&&Date.now()-Date.parse(asset.updated)>300000;
+    $('connection').textContent=stale?'● STALE DATA':asset?'● FEEDS ONLINE':'● FEEDS PENDING';
+    $('connection').className='live-badge'+(stale?' stale':asset?' online':'');
+    if(asset)renderAsset(asset);
+    else{
+      $('signal-status').textContent='AWAITING DATA';
+      $('signal-reason').textContent=current.source_errors?.[selected]||'Waiting for the first completed exchange refresh.';
+      renderCoverage(null);
+      renderLiquidity(null,true);
+    }
+    renderHistory();
+    renderEtf();
+    reconcileBrowserHistory().then(()=>renderSignalLog()).catch(()=>{});
+  }catch(error){
+    $('connection').textContent='● CONNECTION ERROR';
+    $('connection').className='live-badge stale';
+    $('feed-note').textContent=error.message;
+  }
+}
+document.querySelectorAll('[data-symbol]').forEach(button=>button.addEventListener('click',()=>{
+  selected=button.dataset.symbol;
+  document.querySelectorAll('[data-symbol]').forEach(x=>x.classList.toggle('active',x===button));
+  const asset=current?.assets?.[selected];
+  if(asset){renderAsset(asset);renderHistory();$('updated-mini').textContent='Updated '+londonTime(asset.updated)}else load();
+}));
+document.querySelectorAll('[data-fvg-tf]').forEach(button=>button.addEventListener('click',()=>{
+  selectedFvg=button.dataset.fvgTf;
+  document.querySelectorAll('[data-fvg-tf]').forEach(x=>{const active=x===button;x.classList.toggle('active',active);x.setAttribute('aria-pressed',String(active))});
+  const asset=current?.assets?.[selected];if(asset)renderZones(asset);
+}));
+// Mobile browsers suspend JavaScript timers when the tab/app is backgrounded.
+// Resume with an immediate fetch on every return, not the next 2-minute tick.
+// The server continues its own refresh loop while the Render instance is awake.
+let lastFeedRequestAt=0;
+let resumeRequestInFlight=false;
+async function resumeFeed(){
+  if(document.hidden||resumeRequestInFlight)return;
+  // Focus + pageshow + visibilitychange may fire together; coalesce them.
+  if(Date.now()-lastFeedRequestAt<1500)return;
+  resumeRequestInFlight=true;
+  lastFeedRequestAt=Date.now();
+  try{await load()}finally{resumeRequestInFlight=false}
+}
+$('reload').addEventListener('click',()=>{lastFeedRequestAt=0;resumeFeed()});
+load();
+setInterval(()=>{if(!document.hidden)resumeFeed()},120000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)resumeFeed()});
+window.addEventListener('pageshow',()=>resumeFeed());
+window.addEventListener('focus',()=>resumeFeed());
+window.addEventListener('online',()=>resumeFeed());
+// A short foreground watchdog handles browsers that skip resume events.
+// It does not poll while the dashboard is hidden.
+setInterval(()=>{if(!document.hidden&&Date.now()-lastFeedRequestAt>=120000)resumeFeed()},15000);
++v.toLocaleString('en-US',{minimumFractionDigits:1,maximumFractionDigits:1})+'M' : 'PENDING';
+function renderEtf(){
+  const etf=current?.etf||{}, assets=etf.assets||{};
+  const status=$('etf-status'); if(!status)return;
+  status.textContent=Object.keys(assets).length?'DAILY DATA':'AWAITING SOURCE';
+  const cards=['BTC','ETH','SOL','HYPE'].map(key=>{
+    const item=assets[key],flow=item?.total_musd;
+    const cls=typeof flow==='number'?(flow<0?'etf-negative':flow>0?'etf-positive':''):'';
+    return '<div class="etf-asset-card"><small>'+key+' ETF FLOWS</small><strong class="'+cls+'">'+etfFlowFormat(flow)+'</strong><span>'+htmlSafe(item?.date||'No verified report')+(item&&!item.complete?' · PARTIAL':'')+'</span></div>';
+  }).join('');
+  $('etf-asset-grid').innerHTML=cards;
+  document.querySelectorAll('[data-etf-asset]').forEach(button=>button.classList.toggle('active',button.dataset.etfAsset===selectedEtf));
+  const item=assets[selectedEtf];
+  $('etf-report-date').textContent=item?'Session '+item.date+(item.complete?'':' · PARTIAL'):'NO VERIFIED REPORT';
+  $('etf-issuer-list').innerHTML=item?.funds?.length?item.funds.map(f=>{
+    const flow=f.flow_musd;
+    return '<div class="etf-issuer-row"><span><b>'+htmlSafe(f.ticker)+'</b> <small>'+htmlSafe(f.issuer)+'</small></span><strong class="'+(typeof flow==='number'?(flow<0?'etf-negative':flow>0?'etf-positive':''):'')+'">'+etfFlowFormat(flow)+'</strong></div>';
+  }).join(''):'<p class="placeholder">ETF flow data unavailable. The free source may be delayed or temporarily blocked.</p>';
+  $('etf-history').innerHTML=item?.history?.length?'<strong>Recent reporting sessions</strong>'+item.history.slice(0,7).map(row=>'<div class="etf-history-row"><span>'+htmlSafe(row.date)+'</span><b class="'+(row.total_musd<0?'etf-negative':row.total_musd>0?'etf-positive':'')+'">'+etfFlowFormat(row.total_musd)+'</b></div>').join(''):'';
+  const source=$('etf-source-note');
+  source.innerHTML='Source: '+(item?'<a href="'+htmlSafe(item.source)+'" target="_blank" rel="noopener noreferrer">Farside Investors · '+selectedEtf+'</a>':'Farside Investors public ETF tables')+'. Last checked '+htmlSafe(etf.updated?londonTime(etf.updated):'not yet')+'. Daily figures may be delayed/revised. Missing is not zero. ETF flows do not affect LONG/SHORT scoring.';
+}
+document.querySelectorAll('[data-etf-asset]').forEach(button=>button.addEventListener('click',()=>{selectedEtf=button.dataset.etfAsset;renderEtf()}));
+
 async function load(){
   try{
     const response=await fetch('/api/state',{cache:'no-store'});
