@@ -25,7 +25,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.8.9'
+STRATEGY_VERSION = '0.9.0'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -498,7 +498,7 @@ def record_signal_log(symbol, asset, previous_direction, candles=None):
     now=datetime.now(timezone.utc)
     with open_db() as db:
         db.row_factory=sqlite3.Row
-        existing=list(db.execute("SELECT * FROM signals WHERE symbol=? AND strategy_version IN ('0.8.5','0.8.6') ORDER BY id DESC LIMIT 5",(symbol,)))
+        existing=list(db.execute("SELECT * FROM signals WHERE symbol=? AND strategy_version=? ORDER BY id DESC LIMIT 5",(symbol,STRATEGY_VERSION)))
         for row in existing:
             observed=reconcile_signal(row,candles,asset.get('observation_source','Exchange spot · 1M OHLC'))
             db.execute('''UPDATE signals SET status=?,checked_until_ms=?,observed_at=?,
@@ -652,7 +652,7 @@ def calc_asset(symbol, k15, k1h, k4h, kd, ticker, book, trades, funding, oi, spo
         {'name':'200D Moving Average','value':f'${daily_ma200:,.0f}' if daily_ma200 else None,'signal':score_label(50 if daily_ma200 and price>daily_ma200 else -50 if daily_ma200 else None),'source':spot_source},
         {'name':'50D Moving Average','value':f'${daily_ma50:,.0f}' if daily_ma50 else None,'signal':score_label(50 if daily_ma50 and price>daily_ma50 else -50 if daily_ma50 else None),'source':spot_source},
         {'name':'4H Trend','value':f'EMA21 ${e4:,.0f}' if e4 else None,'signal':score_label(50 if e4 and c4[-2]>e4 else -50 if e4 else None),'source':spot_source+' · 4H'},
-        {'name':'Funding Rate','value':f'{float(funding)*100:.4f}%' if funding is not None else None,'signal':'NEUTRAL' if funding is not None else 'UNAVAILABLE','source':'Binance futures (if accessible)'},
+        {'name':'Funding Rate','value':f'{float(funding)*100:.4f}%' if funding is not None else None,'signal':'NEUTRAL' if funding is not None else 'UNAVAILABLE','source':spot_source},
         {'name':'Open Interest','value':f'{oi:,.0f} units' if oi is not None else None,'signal':'NEUTRAL' if oi is not None else 'UNAVAILABLE','source':'Binance futures (if accessible)'},
         {'name':'Order Book Imbalance','value':f'{imbalance*100:+.1f}%' if imbalance is not None else None,'signal':score_label(imbalance*400 if imbalance is not None else None),'source':spot_source+' top levels'},
         {'name':'Bid/Ask Spread','value':f'{spread:.2f} bps' if spread is not None else None,'signal':'NEUTRAL' if spread is not None else 'UNAVAILABLE','source':spot_source+' top of book'},
@@ -1080,8 +1080,88 @@ async def fetch_asset_kraken(client,symbol,macro=None):
     return result
 
 
+def parse_kraken_futures_candles(payload):
+    if not isinstance(payload,dict) or not isinstance(payload.get('candles'),list):
+        raise RuntimeError('Kraken Futures charts returned no candles')
+    candles=[]
+    for x in payload['candles']:
+        timestamp=x.get('time')
+        if isinstance(timestamp,str):
+            ts=int(datetime.fromisoformat(timestamp.replace('Z','+00:00')).timestamp()*1000)
+        else:
+            ts=int(timestamp)
+            if ts<100000000000:
+                ts*=1000
+        candles.append({'ts':ts,'open':float(x['open']),'high':float(x['high']),
+                        'low':float(x['low']),'close':float(x['close']),
+                        'volume':float(x.get('volume') or 0)})
+    return sorted(candles,key=lambda x:x['ts'])
+
+
+async def fetch_asset_kraken_futures(client,symbol,macro=None):
+    """All price-derived indicators, levels and depth from Kraken USD perpetuals."""
+    contract='PF_XBTUSD' if symbol=='BTCUSDT' else 'PF_ETHUSD'
+    base='https://futures.kraken.com'
+    now=int(time.time())
+    timeframes=[('15m',160,900),('1h',160,3600),('4h',160,14400),('1d',260,86400)]
+    requests=[fetch_json(client,f'{base}/api/charts/v1/trade/{contract}/{tf}',
+                         {'from':now-count*seconds-2*seconds})
+              for tf,count,seconds in timeframes]
+    requests.extend([
+        fetch_json(client,base+'/derivatives/api/v3/tickers'),
+        fetch_json(client,base+'/derivatives/api/v3/orderbook',{'symbol':contract}),
+        fetch_json(client,f'{base}/api/charts/v1/trade/{contract}/1m',
+                   {'from':now-24*3600}),
+    ])
+    responses=await asyncio.gather(*requests,return_exceptions=True)
+    if any(isinstance(x,Exception) for x in responses[:6]):
+        raise RuntimeError('Kraken Futures core feed unavailable: '+
+                           ', '.join(str(x)[:70] for x in responses[:6] if isinstance(x,Exception)))
+    k15,k1,k4,kd=[parse_kraken_futures_candles(x) for x in responses[:4]]
+    if min(len(k15),len(k1),len(k4),len(kd))<202:
+        raise RuntimeError('Kraken Futures insufficient completed candle history for 200D analysis')
+    ticker_row=next((x for x in responses[4].get('tickers',[]) if x.get('symbol')==contract),None)
+    if not ticker_row or ticker_row.get('last') is None:
+        raise RuntimeError('Kraken Futures perpetual ticker unavailable')
+    price=float(ticker_row['last'])
+    previous_24h=float(ticker_row.get('open24h') or ticker_row.get('open24Hour') or 0)
+    if previous_24h<=0:
+        previous_24h=float(k1[-25]['close'])
+    ticker={'lastPrice':price,'priceChangePercent':(price/previous_24h-1)*100}
+    rawbook=responses[5]
+    if rawbook.get('result') not in (None,'success'):
+        raise RuntimeError('Kraken Futures order book rejected')
+    rawbook=rawbook.get('orderBook') or rawbook
+    def levels(name):
+        return [[str(x['price']),str(x.get('qty',x.get('size',0)))] if isinstance(x,dict)
+                else [str(x[0]),str(x[1])] for x in rawbook.get(name,[])]
+    book={'bids':levels('bids'),'asks':levels('asks')}
+    if not book['bids'] or not book['asks']:
+        raise RuntimeError('Kraken Futures order book empty')
+    fetched_at=datetime.now(timezone.utc).isoformat()
+    funding=ticker_row.get('fundingRate')
+    oi=ticker_row.get('openInterest')
+    asset=calc_asset(symbol,k15,k1,k4,kd,ticker,book,[],
+                     funding,float(oi) if oi is not None else None,
+                     spot_source='Kraken Futures perpetual',market_pair=contract,
+                     macro=macro,fetched_at=fetched_at)
+    asset['liquidity_map']=build_broad_liquidity(None,symbol,book,price,
+                                                 'Kraken Futures perpetual · order book')
+    asset['mark_price']=float(ticker_row['markPrice']) if ticker_row.get('markPrice') is not None else None
+    asset['price_type']='LAST TRADE'
+    asset['provider_note']='Kraken USD perpetual futures; no spot-price substitution.'
+    asset['observation_source']='Kraken Futures perpetual · completed 1M traded-price OHLC'
+    if isinstance(responses[6],Exception):
+        asset['_observation_candles']=None
+    else:
+        asset['_observation_candles']=parse_kraken_futures_candles(responses[6])[:-1]
+    return asset
+
+
 async def fetch_asset(client,symbol,macro=None):
     provider=os.getenv('MARKET_PROVIDER','auto').lower()
+    if provider=='kraken_futures':
+        return await fetch_asset_kraken_futures(client,symbol,macro)
     if provider=='kraken':
         return await fetch_asset_kraken(client,symbol,macro)
     if provider=='binance':
@@ -1188,7 +1268,6 @@ async def wintermute_loop():
 @asynccontextmanager
 async def lifespan(app):
     init_db()
-    asyncio.create_task(log_kraken_futures_connectivity())
     task=asyncio.create_task(loop())
     wintermute_task=asyncio.create_task(wintermute_loop())
     yield
@@ -1256,7 +1335,7 @@ async def state():
             for row in rows:
                 row.pop('book_snapshot',None)
         # Never expose migrated legacy rows, including any stale in-memory snapshot.
-        data['signal_log']={symbol:[row for row in rows if row.get('strategy_version') in ('0.8.5','0.8.6')][:5]
+        data['signal_log']={symbol:[row for row in rows if row.get('strategy_version') == STRATEGY_VERSION][:5]
                             for symbol,rows in data['signal_log'].items()}
         return JSONResponse(data,headers={'Cache-Control':'no-store, max-age=0'})
 
