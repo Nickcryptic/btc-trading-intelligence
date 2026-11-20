@@ -21,7 +21,7 @@ services:
       - key: ALERTS_ENABLED
         value: 'false'
       - key: MARKET_PROVIDER
-        value: kraken
+        value: kraken_futures
       - key: DB_PATH
         value: /tmp/btc-intelligence-signals.db
       - key: DATABASE_URL
