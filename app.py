@@ -8,6 +8,8 @@ import sqlite3
 import psycopg
 from psycopg.rows import dict_row
 import time
+import re
+from html.parser import HTMLParser
 from statistics import median
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -25,8 +27,8 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.9.3'
-STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
+STRATEGY_VERSION = '0.9.4'
+STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
 REPLAY_CACHE = {}
@@ -1244,6 +1246,251 @@ async def log_binance_futures_connectivity():
                     LOG.warning('BINANCE_FUTURES_CHECK host=%s endpoint=%s error=%s',
                                 host,endpoint,type(exc).__name__)
 
+
+
+# ETF feeds are daily US fund flows, NOT real-time futures executions.
+# No API key is required for the public Farside tables. Never turn blanks into zero.
+ETF_SOURCES = {
+    'BTC': ('https://farside.co.uk/bitcoin-etf-flow-all-data/', ['IBIT','FBTC','BITB','ARKB','BTCO','EZBC','BRRR','HODL','BTCW','MSBT','GBTC','BTC']),
+    'ETH': ('https://farside.co.uk/eth/', ['ETHA','ETHB','FETH','ETHW','TETH','ETHV','QETH','EZET','ETHE','ETH']),
+    'SOL': ('https://farside.co.uk/sol/', ['BSOL','VSOL','FSOL','TSOL','SOEZ','GSOL']),
+    'HYPE': ('https://farside.co.uk/hyp/', ['BHYP','THYP','HYPG']),
+}
+ETF_ISSUERS = {'IBIT':'BlackRock','ETHA':'BlackRock','ETHB':'BlackRock','FBTC':'Fidelity','FETH':'Fidelity','FSOL':'Fidelity','GBTC':'Grayscale','BTC':'Grayscale','ETHE':'Grayscale','ETH':'Grayscale','GSOL':'Grayscale','ARKB':'ARK 21Shares','MSBT':'Morgan Stanley','BTCW':'WisdomTree','BITB':'Bitwise','BSOL':'Bitwise','BHYP':'Bitwise'}
+class _ETFTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tables=[]; self.table=None; self.row=None; self.cell=None; self.depth=0
+    def handle_starttag(self,tag,attrs):
+        if tag=='table':
+            if self.table is None: self.table=[]; self.depth=1
+            else: self.depth+=1
+        elif self.table is not None and tag=='tr': self.row=[]
+        elif self.row is not None and tag in ('td','th'): self.cell=[]
+    def handle_data(self,data):
+        if self.cell is not None: self.cell.append(data)
+    def handle_endtag(self,tag):
+        if tag in ('td','th') and self.cell is not None:
+            self.row.append(' '.join(''.join(self.cell).split())); self.cell=None
+        elif tag=='tr' and self.row is not None:
+            if self.row: self.table.append(self.row)
+            self.row=None
+        elif tag=='table' and self.table is not None:
+            self.depth-=1
+            if self.depth==0: self.tables.append(self.table); self.table=None
+def _etf_number(value):
+    v=str(value or '').strip().replace(',','').replace('
+    while True:
+        started=asyncio.get_running_loop().time()
+        try: await refresh()
+        except Exception: LOG.exception('Refresh error')
+        elapsed=asyncio.get_running_loop().time()-started
+        await asyncio.sleep(max(1,120-elapsed))
+
+
+async def wintermute_loop():
+    while True:
+        try:
+            observations = record_wintermute_unavailable()
+            async with LOCK:
+                STATE['wintermute'] = observations
+        except Exception:
+            LOG.exception('Wintermute observation logging error')
+        await asyncio.sleep(300)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    init_db()
+    task=asyncio.create_task(loop())
+    wintermute_task=asyncio.create_task(wintermute_loop())
+    etf_task=asyncio.create_task(etf_loop())
+    yield
+    task.cancel()
+    wintermute_task.cancel()
+    etf_task.cancel()
+    try: await task
+    except asyncio.CancelledError: pass
+    try: await wintermute_task
+    except asyncio.CancelledError: pass
+    try: await etf_task
+    except asyncio.CancelledError: pass
+
+app=FastAPI(title='BTC Intelligence',version=STRATEGY_VERSION,lifespan=lifespan)
+
+
+@app.middleware('http')
+async def optional_private_access(request: Request, call_next):
+    password = os.getenv('DASHBOARD_PASSWORD', '')
+    if password and request.url.path != '/api/health':
+        auth = request.headers.get('Authorization', '')
+        username, received = '', ''
+        if auth.startswith('Basic '):
+            try:
+                username, received = b64decode(auth[6:]).decode('utf-8').split(':', 1)
+            except (ValueError, UnicodeDecodeError):
+                pass
+        if not (compare_digest(username, 'trader') and compare_digest(received, password)):
+            return Response(status_code=401, headers={'WWW-Authenticate':'Basic realm="Market Intelligence"'})
+    return await call_next(request)
+app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
+
+@app.get('/')
+async def index(): return FileResponse(ROOT/'static'/'index.html',headers={'Cache-Control':'no-store, max-age=0, must-revalidate'})
+
+@app.get('/api/futures-feed-check')
+async def futures_feed_check():
+    """Read-only reachability check from the actual Render host; no fallback to spot."""
+    endpoints = {
+        'binance_usdm_last': 'https://fapi.binance.com/fapi/v1/ticker/price',
+        'binance_usdm_mark': 'https://fapi.binance.com/fapi/v1/premiumIndex',
+        'binance_usdm_candles': 'https://fapi.binance.com/fapi/v1/klines',
+        'binance_usdm_alternate': 'https://fapi1.binance.com/fapi/v1/ticker/price',
+    }
+    results = {}
+    async with httpx.AsyncClient(timeout=6) as client:
+        for name,url in endpoints.items():
+            try:
+                params={'symbol':'BTCUSDT'}
+                if name=='binance_usdm_candles':
+                    params.update(interval='1m',limit=2)
+                response=await client.get(url,params=params)
+                results[name]={'reachable':response.status_code==200,'http_status':response.status_code}
+            except httpx.HTTPError as exc:
+                results[name]={'reachable':False,'error':type(exc).__name__}
+    return {'version':STRATEGY_VERSION,'results':results}
+
+
+@app.get('/api/health')
+async def health(): return {'ok':True,'version':STATE['version'],'updated':STATE['updated'],'assets_live':list(STATE['assets'])}
+
+@app.get('/api/state')
+async def state():
+    async with LOCK:
+        data=json.loads(json.dumps(STATE))
+        data.pop('observation_candles',None)
+        for rows in data['liquidity_history'].values():
+            for row in rows:
+                row.pop('book_snapshot',None)
+        # Never expose migrated legacy rows, including any stale in-memory snapshot.
+        data['signal_log']={symbol:[row for row in rows if row.get('strategy_version') in ('0.9.2', STRATEGY_VERSION)][:5]
+                            for symbol,rows in data['signal_log'].items()}
+        return JSONResponse(data,headers={'Cache-Control':'no-store, max-age=0'})
+
+ 
+@app.post('/api/reconcile-cached-signals')
+async def reconcile_cached_signals(request: Request):
+    """Re-check browser-only paper rows after ephemeral server DB replacement.
+
+    Read-only: browser-provided signals are never inserted in server history.
+    """
+    raw=await request.body()
+    if len(raw)>12000:
+        return JSONResponse({'error':'Request too large'},status_code=413)
+    try:
+        payload=json.loads(raw)
+        symbol=payload['symbol']
+        rows=payload['rows']
+        if symbol not in SYMBOLS or not isinstance(rows,list) or len(rows)>5:
+            raise ValueError('Unsupported symbol or row count')
+        cleaned=[]
+        for row in rows:
+            if row.get('side') not in ('LONG','SHORT') or not isinstance(row.get('ts'),str):
+                raise ValueError('Invalid signal metadata')
+            values={key:float(row[key]) for key in ('entry','stop','tp1','tp2','tp3')}
+            if not all(math.isfinite(value) and value>0 for value in values.values()):
+                raise ValueError('Invalid price levels')
+            cleaned.append({**{key:row.get(key) for key in ('ts','symbol','side','status',
+                            'strategy_version','candle_ts','model_score','setup_type',
+                            'checked_until_ms','observed_at','observation_source',
+                            'coverage','verification_note')},**values})
+        async with LOCK:
+            candles=STATE['observation_candles'].get(symbol)
+            source=STATE['assets'].get(symbol,{}).get('observation_source','Exchange spot · 1M OHLC')
+        results=[reconcile_signal({**row,'status':row['status'] or 'TRACKING'},candles,source) for row in cleaned]
+        for row in results:
+            row['history_source']='BROWSER RECOVERED'
+        return {'rows':results}
+    except (KeyError,ValueError,TypeError,OverflowError,AttributeError) as exc:
+        return JSONResponse({'error':str(exc)[:100]},status_code=400)
+
+@app.get('/api/signals')
+async def signals():
+    with open_db() as db:
+        db.row_factory=sqlite3.Row
+        return {'signals':[dict(r) for r in db.execute('SELECT * FROM signals ORDER BY id DESC LIMIT 50')]}
+
+
+@app.get('/api/wintermute')
+async def wintermute():
+    async with LOCK:
+        return {'observations':list(STATE['wintermute']),'has_verified_trade_feed':False}
+,'')
+    if not v or v in ('-','—','N/A','Pending'): return None
+    if v.startswith('(') and v.endswith(')'): v='-'+v[1:-1]
+    try: return float(v)
+    except ValueError: return None
+def _parse_etf_table(html, tickers):
+    parser=_ETFTableParser(); parser.feed(html)
+    found=[]
+    for table in parser.tables:
+        # Find the actual ticker header rather than assuming table/column position.
+        headers=[]
+        for row in table[:10]:
+            matches=[(i,cell.upper()) for i,cell in enumerate(row) if cell.upper() in tickers]
+            if len(matches)>=2: headers=matches; break
+        if not headers: continue
+        daily=[]
+        for row in table:
+            if not row: continue
+            try: date=datetime.strptime(row[0].strip(),'%d %b %Y').date().isoformat()
+            except ValueError: continue
+            funds=[]
+            for i,ticker in headers:
+                if i<len(row):
+                    v=_etf_number(row[i])
+                    funds.append({'ticker':ticker,'issuer':ETF_ISSUERS.get(ticker,ticker),'flow_musd':v})
+            # A blank row is not a confirmed zero-flow session.
+            valid=[x['flow_musd'] for x in funds if x['flow_musd'] is not None]
+            if not valid: continue
+            total=_etf_number(row[-1])
+            if total is None: continue
+            daily.append({'date':date,'total_musd':total,'funds':funds,
+                          'complete':len(valid)==len(funds)})
+        if daily: found.extend(daily)
+    if not found: raise ValueError('No valid dated ETF fund-flow table')
+    unique={x['date']:x for x in found}
+    return [unique[k] for k in sorted(unique,reverse=True)][:30]
+async def refresh_etf():
+    results={}; errors={}
+    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={'User-Agent':'Mozilla/5.0 (compatible; BTC-Intelligence/0.9.4)'}) as client:
+        async def one(asset,url,tickers):
+            try:
+                response=await client.get(url); response.raise_for_status()
+                rows=_parse_etf_table(response.text,tickers)
+                return asset,{'date':rows[0]['date'],'total_musd':rows[0]['total_musd'],
+                              'funds':rows[0]['funds'],'complete':rows[0]['complete'],
+                              'history':rows,'source':url,'source_name':'Farside Investors'}
+            except Exception as exc:
+                LOG.warning('ETF %s fetch failed: %s',asset,str(exc)[:160])
+                return asset,{'error':str(exc)[:130],'source':url}
+        data=await asyncio.gather(*(one(asset,*config) for asset,config in ETF_SOURCES.items()))
+    for asset,value in data:
+        if 'error' in value: errors[asset]=value['error']
+        else: results[asset]=value
+    async with LOCK:
+        previous=STATE.get('etf',{}).get('assets',{})
+        previous.update(results)
+        STATE['etf']={'status':'online' if results else 'unavailable',
+                      'assets':previous,'errors':errors,
+                      'updated':datetime.now(timezone.utc).isoformat(),
+                      'unsupported':['ZEC','LINK','DOGE','NEAR','TRX','DOT','LTC','BNB','AVAX','XRP'],
+                      'note':'Daily fund flows; delayed and subject to revision. Missing is not zero. Excluded from LONG/SHORT scoring.'}
+async def etf_loop():
+    while True:
+        try: await refresh_etf()
+        except Exception: LOG.exception('ETF refresh error')
+        await asyncio.sleep(1800)
 
 async def loop():
     while True:
