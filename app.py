@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.9.6'
+STRATEGY_VERSION = '0.9.7'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1316,20 +1316,74 @@ def _parse_etf_table(html, tickers):
     if not found: raise ValueError('No valid dated ETF fund-flow table')
     unique={x['date']:x for x in found}
     return [unique[k] for k in sorted(unique,reverse=True)][:30]
+def _coinboss_etf_rows(detail, totals):
+    """Normalize documented CoinBoss USD-million matrix and aggregate histories."""
+    if not isinstance(detail, dict) or detail.get('success') is not True:
+        raise ValueError('CoinBoss detail returned no successful payload')
+    if detail.get('unit') != 'million_usd':
+        raise ValueError('Unexpected ETF detail units')
+    matrix = detail.get('data')
+    if not isinstance(matrix, dict):
+        raise ValueError('Missing ETF per-fund matrix')
+    columns = detail.get('tickers') or []
+    if not isinstance(columns, list):
+        raise ValueError('Invalid ETF ticker list')
+    issuers = {c.get('ticker'): c.get('issuer') for c in columns
+               if isinstance(c, dict) and c.get('ticker') and c.get('ticker') != 'TOTAL'}
+    flow_by_date = {}
+    if isinstance(totals, dict) and totals.get('success') is True and totals.get('unit') == 'million_usd':
+        for rec in totals.get('data', []):
+            if isinstance(rec, dict) and isinstance(rec.get('date'), str):
+                val = rec.get('flow')
+                if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
+                    flow_by_date[rec['date']] = float(val)
+    dates = set(matrix) | set(flow_by_date)
+    rows = []
+    for date in sorted(dates, reverse=True):
+        try: datetime.strptime(date, '%Y-%m-%d')
+        except (ValueError, TypeError): continue
+        cells = matrix.get(date) or {}
+        if not isinstance(cells, dict): cells = {}
+        funds = []
+        for ticker, issuer in issuers.items():
+            val = cells.get(ticker)
+            flow = (float(val) if isinstance(val, (int,float)) and not isinstance(val,bool) and math.isfinite(val) else None)
+            funds.append({'ticker':ticker,'issuer':issuer or ETF_ISSUERS.get(ticker,ticker),'flow_musd':flow})
+        total = cells.get('TOTAL')
+        if not isinstance(total,(int,float)) or isinstance(total,bool) or not math.isfinite(total):
+            total = flow_by_date.get(date)
+        if total is None: continue
+        rows.append({'date':date,'total_musd':float(total),'funds':funds,
+                     'complete':bool(funds) and all(f['flow_musd'] is not None for f in funds)})
+    if not rows:
+        raise ValueError('No verified dated ETF flows')
+    return rows[:30]
+
+
 async def refresh_etf():
-    results={}; errors={}
-    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={'User-Agent':'Mozilla/5.0 (compatible; BTC-Intelligence/0.9.4)'}) as client:
-        async def one(asset,url,tickers):
+    """Daily ETF flow monitor; isolated from the 2-minute futures signal engine."""
+    results = {}; errors = {}
+    async with httpx.AsyncClient(timeout=18,follow_redirects=True,
+            headers={'User-Agent':'BTC-Intelligence/0.9.7','Accept':'application/json'}) as client:
+        async def one(asset):
+            base='https://www.coinboss.com/api/etf/'
+            detail_url=base+'detail'
+            flows_url=base+'flows'
             try:
-                response=await client.get(url); response.raise_for_status()
-                rows=_parse_etf_table(response.text,tickers)
+                detail_resp, flow_resp = await asyncio.gather(
+                    client.get(detail_url,params={'asset':asset,'days':30}),
+                    client.get(flows_url,params={'asset':asset,'days':30}))
+                detail_resp.raise_for_status()
+                flow_resp.raise_for_status()
+                rows=_coinboss_etf_rows(detail_resp.json(),flow_resp.json())
                 return asset,{'date':rows[0]['date'],'total_musd':rows[0]['total_musd'],
                               'funds':rows[0]['funds'],'complete':rows[0]['complete'],
-                              'history':rows,'source':url,'source_name':'Farside Investors'}
+                              'history':rows,'source':detail_url+'?asset='+asset+'&days=30',
+                              'source_name':'CoinBoss'}
             except Exception as exc:
-                LOG.warning('ETF %s fetch failed: %s',asset,str(exc)[:160])
-                return asset,{'error':str(exc)[:130],'source':url}
-        data=await asyncio.gather(*(one(asset,*config) for asset,config in ETF_SOURCES.items()))
+                LOG.warning('CoinBoss ETF %s unavailable: %s',asset,str(exc)[:180])
+                return asset,{'error':str(exc)[:130]}
+        data=await asyncio.gather(*(one(asset) for asset in ('BTC','ETH','SOL','HYPE')))
     for asset,value in data:
         if 'error' in value: errors[asset]=value['error']
         else: results[asset]=value
@@ -1340,7 +1394,9 @@ async def refresh_etf():
                       'assets':previous,'errors':errors,
                       'updated':datetime.now(timezone.utc).isoformat(),
                       'unsupported':['ZEC','LINK','DOGE','NEAR','TRX','DOT','LTC','BNB','AVAX','XRP'],
-                      'note':'Daily fund flows; delayed and subject to revision. Missing is not zero. Excluded from LONG/SHORT scoring.'}
+                      'note':'Daily US spot ETF flows, USD millions; delayed and subject to revision. Missing is not zero. Excluded from LONG/SHORT scoring.'}
+
+
 async def etf_loop():
     while True:
         try: await refresh_etf()
