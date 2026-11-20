@@ -315,7 +315,7 @@ function renderEtf(){
   }).join(''):'<p class="placeholder">ETF flow data unavailable. The free source may be delayed or temporarily blocked.</p>';
   $('etf-history').innerHTML=item?.history?.length?'<strong>Recent reporting sessions</strong>'+item.history.slice(0,7).map(row=>'<div class="etf-history-row"><span>'+htmlSafe(row.date)+'</span><b class="'+(row.total_musd<0?'etf-negative':row.total_musd>0?'etf-positive':'')+'">'+etfFlowFormat(row.total_musd)+'</b></div>').join(''):'';
   const source=$('etf-source-note');
-  source.innerHTML='Source: '+(item?'<a href="'+htmlSafe(item.source)+'" target="_blank" rel="noopener noreferrer">Farside Investors · '+selectedEtf+'</a>':'Farside Investors public ETF tables')+'. Last checked '+htmlSafe(etf.updated?londonTime(etf.updated):'not yet')+'. Daily figures may be delayed/revised. Missing is not zero. ETF flows do not affect LONG/SHORT scoring.';
+  source.innerHTML='Source: '+(item?'<a href="'+htmlSafe(item.source)+'" target="_blank" rel="noopener noreferrer">'+htmlSafe(item.source_name||'CoinBoss')+' · '+selectedEtf+'</a>':'CoinBoss ETF API')+'. Last checked '+htmlSafe(etf.updated?londonTime(etf.updated):'not yet')+'. Daily figures may be delayed/revised. Missing is not zero. ETF flows do not affect LONG/SHORT scoring.';
 }
 document.querySelectorAll('[data-etf-asset]').forEach(button=>button.addEventListener('click',()=>{selectedEtf=button.dataset.etfAsset;renderEtf()}));
 
