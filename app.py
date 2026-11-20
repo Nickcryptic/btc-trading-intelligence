@@ -1279,153 +1279,8 @@ class _ETFTableParser(HTMLParser):
             self.depth-=1
             if self.depth==0: self.tables.append(self.table); self.table=None
 def _etf_number(value):
-    v=str(value or '').strip().replace(',','').replace('
-    while True:
-        started=asyncio.get_running_loop().time()
-        try: await refresh()
-        except Exception: LOG.exception('Refresh error')
-        elapsed=asyncio.get_running_loop().time()-started
-        await asyncio.sleep(max(1,120-elapsed))
+    v=str(value or '').strip().replace(',','').replace(chr(36),'')
 
-
-async def wintermute_loop():
-    while True:
-        try:
-            observations = record_wintermute_unavailable()
-            async with LOCK:
-                STATE['wintermute'] = observations
-        except Exception:
-            LOG.exception('Wintermute observation logging error')
-        await asyncio.sleep(300)
-
-
-@asynccontextmanager
-async def lifespan(app):
-    init_db()
-    task=asyncio.create_task(loop())
-    wintermute_task=asyncio.create_task(wintermute_loop())
-    etf_task=asyncio.create_task(etf_loop())
-    yield
-    task.cancel()
-    wintermute_task.cancel()
-    etf_task.cancel()
-    try: await task
-    except asyncio.CancelledError: pass
-    try: await wintermute_task
-    except asyncio.CancelledError: pass
-    try: await etf_task
-    except asyncio.CancelledError: pass
-
-app=FastAPI(title='BTC Intelligence',version=STRATEGY_VERSION,lifespan=lifespan)
-
-
-@app.middleware('http')
-async def optional_private_access(request: Request, call_next):
-    password = os.getenv('DASHBOARD_PASSWORD', '')
-    if password and request.url.path != '/api/health':
-        auth = request.headers.get('Authorization', '')
-        username, received = '', ''
-        if auth.startswith('Basic '):
-            try:
-                username, received = b64decode(auth[6:]).decode('utf-8').split(':', 1)
-            except (ValueError, UnicodeDecodeError):
-                pass
-        if not (compare_digest(username, 'trader') and compare_digest(received, password)):
-            return Response(status_code=401, headers={'WWW-Authenticate':'Basic realm="Market Intelligence"'})
-    return await call_next(request)
-app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
-
-@app.get('/')
-async def index(): return FileResponse(ROOT/'static'/'index.html',headers={'Cache-Control':'no-store, max-age=0, must-revalidate'})
-
-@app.get('/api/futures-feed-check')
-async def futures_feed_check():
-    """Read-only reachability check from the actual Render host; no fallback to spot."""
-    endpoints = {
-        'binance_usdm_last': 'https://fapi.binance.com/fapi/v1/ticker/price',
-        'binance_usdm_mark': 'https://fapi.binance.com/fapi/v1/premiumIndex',
-        'binance_usdm_candles': 'https://fapi.binance.com/fapi/v1/klines',
-        'binance_usdm_alternate': 'https://fapi1.binance.com/fapi/v1/ticker/price',
-    }
-    results = {}
-    async with httpx.AsyncClient(timeout=6) as client:
-        for name,url in endpoints.items():
-            try:
-                params={'symbol':'BTCUSDT'}
-                if name=='binance_usdm_candles':
-                    params.update(interval='1m',limit=2)
-                response=await client.get(url,params=params)
-                results[name]={'reachable':response.status_code==200,'http_status':response.status_code}
-            except httpx.HTTPError as exc:
-                results[name]={'reachable':False,'error':type(exc).__name__}
-    return {'version':STRATEGY_VERSION,'results':results}
-
-
-@app.get('/api/health')
-async def health(): return {'ok':True,'version':STATE['version'],'updated':STATE['updated'],'assets_live':list(STATE['assets'])}
-
-@app.get('/api/state')
-async def state():
-    async with LOCK:
-        data=json.loads(json.dumps(STATE))
-        data.pop('observation_candles',None)
-        for rows in data['liquidity_history'].values():
-            for row in rows:
-                row.pop('book_snapshot',None)
-        # Never expose migrated legacy rows, including any stale in-memory snapshot.
-        data['signal_log']={symbol:[row for row in rows if row.get('strategy_version') in ('0.9.2', STRATEGY_VERSION)][:5]
-                            for symbol,rows in data['signal_log'].items()}
-        return JSONResponse(data,headers={'Cache-Control':'no-store, max-age=0'})
-
- 
-@app.post('/api/reconcile-cached-signals')
-async def reconcile_cached_signals(request: Request):
-    """Re-check browser-only paper rows after ephemeral server DB replacement.
-
-    Read-only: browser-provided signals are never inserted in server history.
-    """
-    raw=await request.body()
-    if len(raw)>12000:
-        return JSONResponse({'error':'Request too large'},status_code=413)
-    try:
-        payload=json.loads(raw)
-        symbol=payload['symbol']
-        rows=payload['rows']
-        if symbol not in SYMBOLS or not isinstance(rows,list) or len(rows)>5:
-            raise ValueError('Unsupported symbol or row count')
-        cleaned=[]
-        for row in rows:
-            if row.get('side') not in ('LONG','SHORT') or not isinstance(row.get('ts'),str):
-                raise ValueError('Invalid signal metadata')
-            values={key:float(row[key]) for key in ('entry','stop','tp1','tp2','tp3')}
-            if not all(math.isfinite(value) and value>0 for value in values.values()):
-                raise ValueError('Invalid price levels')
-            cleaned.append({**{key:row.get(key) for key in ('ts','symbol','side','status',
-                            'strategy_version','candle_ts','model_score','setup_type',
-                            'checked_until_ms','observed_at','observation_source',
-                            'coverage','verification_note')},**values})
-        async with LOCK:
-            candles=STATE['observation_candles'].get(symbol)
-            source=STATE['assets'].get(symbol,{}).get('observation_source','Exchange spot · 1M OHLC')
-        results=[reconcile_signal({**row,'status':row['status'] or 'TRACKING'},candles,source) for row in cleaned]
-        for row in results:
-            row['history_source']='BROWSER RECOVERED'
-        return {'rows':results}
-    except (KeyError,ValueError,TypeError,OverflowError,AttributeError) as exc:
-        return JSONResponse({'error':str(exc)[:100]},status_code=400)
-
-@app.get('/api/signals')
-async def signals():
-    with open_db() as db:
-        db.row_factory=sqlite3.Row
-        return {'signals':[dict(r) for r in db.execute('SELECT * FROM signals ORDER BY id DESC LIMIT 50')]}
-
-
-@app.get('/api/wintermute')
-async def wintermute():
-    async with LOCK:
-        return {'observations':list(STATE['wintermute']),'has_verified_trade_feed':False}
-,'')
     if not v or v in ('-','—','N/A','Pending'): return None
     if v.startswith('(') and v.endswith(')'): v='-'+v[1:-1]
     try: return float(v)
@@ -1517,12 +1372,16 @@ async def lifespan(app):
     init_db()
     task=asyncio.create_task(loop())
     wintermute_task=asyncio.create_task(wintermute_loop())
+    etf_task=asyncio.create_task(etf_loop())
     yield
     task.cancel()
     wintermute_task.cancel()
+    etf_task.cancel()
     try: await task
     except asyncio.CancelledError: pass
     try: await wintermute_task
+    except asyncio.CancelledError: pass
+    try: await etf_task
     except asyncio.CancelledError: pass
 
 app=FastAPI(title='BTC Intelligence',version=STRATEGY_VERSION,lifespan=lifespan)
