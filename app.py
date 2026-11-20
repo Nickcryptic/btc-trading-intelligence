@@ -1335,7 +1335,7 @@ async def state():
             for row in rows:
                 row.pop('book_snapshot',None)
         # Never expose migrated legacy rows, including any stale in-memory snapshot.
-        data['signal_log']={symbol:[row for row in rows if row.get('strategy_version') == STRATEGY_VERSION][:5]
+        data['signal_log']={symbol:[row for row in rows if row.get('strategy_version') in ('0.9.2', STRATEGY_VERSION)][:5]
                             for symbol,rows in data['signal_log'].items()}
         return JSONResponse(data,headers={'Cache-Control':'no-store, max-age=0'})
 
