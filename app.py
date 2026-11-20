@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.9.9'
+STRATEGY_VERSION = '0.10.0'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -770,7 +770,7 @@ def build_broad_liquidity(payload,symbol,fallback_book,price,fallback_source):
     return wide_liquidity_snapshot(fallback_book,price,fallback_source,'USD')
 
 
-def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=None,trade_imbalance=None):
+def legacy_professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=None,trade_imbalance=None):
     """Adaptive, *unvalidated* trend/pullback model; points are evidence, not win odds.
 
     Only completed 15M/1H/4H/1D candles influence direction; the live quote
@@ -975,6 +975,78 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=Non
         if not spread_ok:blockers.append('spread unavailable or too wide')
         result['reason']=f'Conditional {result["watch_direction"]} above/below ${watch_entry:,.2f}; waiting: '+', '.join(blockers)+'.'
     return result
+
+
+def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=None,trade_imbalance=None):
+    """Independent regime/structure entry model, with the original model as fallback.
+
+    Uses only closed bars for structure and signals; a live quote is used for
+    execution proximity. A trend is not itself an entry. Both directions are
+    evaluated independently and a fresh break/retest is required.
+    """
+    legacy=legacy_professional_decision(k15,k1h,k4h,kd,price,spread,targets,imbalance,trade_imbalance)
+    if min(len(k15),len(k1h),len(k4h))<72 or not math.isfinite(price) or price<=0:
+        return legacy
+    bars=k15[:-1]; hours=k1h[:-1]
+    a=atr(bars)
+    if not a or a<=0:return legacy
+    closes=[x['close'] for x in bars]
+    hclose=[x['close'] for x in hours]
+    ema9=ema(closes,9); ema21=ema(closes,21)
+    hfast=ema(hclose,21); hslow=ema(hclose,55)
+    median_vol=median(x['volume'] for x in bars[-21:-1])
+    volume=bars[-1]['volume']/median_vol if median_vol>0 else 0
+    spread_ok=spread is not None and math.isfinite(spread) and 0<=spread<=6
+    atr_ok=0.045<=100*a/price<=3.5
+    latest=bars[-1]
+    candidates=[]
+    for side in (1,-1):
+        # Two entry archetypes: fresh structural break, or pullback rejection
+        # following a break within the last 8 completed bars.
+        prior=bars[-14:-2]
+        pivot=max(x['high'] for x in prior) if side==1 else min(x['low'] for x in prior)
+        fresh=(latest['close']-pivot)*side>0.10*a and (latest['close']-latest['open'])*side>0.35*a
+        recent_break=any((x['close']-pivot)*side>0.10*a for x in bars[-8:-1])
+        retest=recent_break and (latest['low']<=ema9+0.25*a if side==1 else latest['high']>=ema9-0.25*a)
+        rejection=retest and (latest['close']-latest['open'])*side>0.15*a and (latest['close']-ema9)*side>0
+        structure='15M STRUCTURE BREAK' if fresh else '15M BREAK / RETEST' if rejection else None
+        if not structure:continue
+        momentum=(ema9-ema21)*side>0 and (closes[-1]-closes[-4])*side>0
+        hour_confirm=(hclose[-1]-hclose[-4])*side>0 and (hclose[-1]-hfast)*side>0
+        if not (momentum and hour_confirm):continue
+        # A stop beyond the most recent swing and a minimum ATR buffer.
+        swing=min(x['low'] for x in bars[-7:]) if side==1 else max(x['high'] for x in bars[-7:])
+        stop=min(swing-0.15*a,price-1.1*a) if side==1 else max(swing+0.15*a,price+1.1*a)
+        risk=abs(price-stop)
+        proximity=abs(price-latest['close'])<=0.75*a and abs(price-ema21)<=4.2*a
+        geometry=0.10<=100*risk/price<=2.0 and risk<=3.0*a
+        # Do not infer actual market execution from a paper candidate.
+        score=30+20+15+(15 if fresh else 10)+(10 if volume>=1 else 5)+(10 if (hfast-hslow)*side>0 else 0)
+        if not (spread_ok and atr_ok and proximity and geometry and volume>=0.55):continue
+        if score<70:continue
+        candidates.append((score,side,structure,stop,risk))
+    if candidates:
+        score,side,structure,stop,risk=max(candidates,key=lambda x:x[0])
+        if legacy.get('direction')!='NO TRADE' and legacy.get('signal_score',0)>=score:
+            return legacy
+        levels={'entry':round(price,2),'stop':round(stop,2),
+                'tp1':round(price+side*1.2*risk,2),'tp2':round(price+side*2*risk,2),
+                'tp3':round(price+side*3*risk,2),'risk_pct':round(100*risk/price,2),
+                'status':'PAPER RESEARCH — NOT FILLED'}
+        legacy.update({'direction':'LONG CANDIDATE' if side==1 else 'SHORT CANDIDATE',
+                       'levels':levels,'signal_score':score,
+                       'signal_grade':'HIGH' if score>=85 else 'MODERATE',
+                       'signal_candle_ts':latest['ts'],'trigger':structure,
+                       'watch_direction':'LONG' if side==1 else 'SHORT',
+                       'watch_levels':None,'trigger_price':None,
+                       'reason':f'{structure}: independent closed-candle trend and structure confirmation; {score}/100 heuristic score, not win probability.'})
+        legacy['checks']=[{'label':'15M structure','ok':True,'detail':structure},
+                          {'label':'15M / 1H momentum','ok':True,'detail':'ALIGNED'},
+                          {'label':'Spread and ATR','ok':True,'detail':'ACCEPTABLE'},
+                          {'label':'Entry distance and stop','ok':True,'detail':f'{levels["risk_pct"]:.2f}% risk'}]
+    elif legacy.get('direction')=='NO TRADE':
+        legacy['reason']+=' Alternative structure model: no fresh confirmed break/retest with safe entry geometry.'
+    return legacy
 
 
 def replay_recent_candles(k15,k1h,k4h,kd,round_trip_cost_bps=20):
