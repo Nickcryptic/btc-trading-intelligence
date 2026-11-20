@@ -285,3 +285,18 @@ footer b{color:#b1bdc8}
 @media(max-width:600px){.liquidity-evaluation{padding:20px 15px}.liquidity-evaluation .section-heading{flex-wrap:wrap}.liquidity-state{font-size:26px}.liquidity-metrics{gap:8px}.liquidity-metrics>div{padding:12px 10px}.liquidity-metrics strong{font-size:22px}.liquidity-sequence-head,.liquidity-sequence-row{grid-template-columns:43px 61px 65px minmax(0,1fr);gap:5px}.liquidity-sequence-head{font-size:8px}.liquidity-sequence-row{font-size:10px}.liq-label{font-size:8px;padding:6px 3px}}
 @media(max-width:480px){.structure-targets{grid-template-columns:1fr}.wall-zone-top b{font-size:11px}.wall-highlight strong{font-size:11px}.signal-status.wait{font-size:clamp(27px,7vw,36px)}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+
+/* v0.9.4 ETF institutional monitor */
+.etf-monitor{margin:24px 0}.etf-asset-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:20px 0}
+.etf-asset-card{background:rgba(126,151,181,.08);border:1px solid rgba(126,151,181,.17);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:9px;min-width:0}
+.etf-asset-card small,.etf-asset-card span{font-size:11px;color:#9baec5}.etf-asset-card strong{font-size:clamp(17px,2.3vw,27px);font-weight:750;overflow-wrap:anywhere}
+.etf-negative{color:#ff7894!important}.etf-positive{color:#37e7bd!important}
+.etf-issuer-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:16px 0 12px}.etf-issuer-head span{font-size:12px;color:#9baec5}
+.etf-asset-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.etf-asset-tabs button{cursor:pointer;background:rgba(126,151,181,.08);border:1px solid rgba(126,151,181,.24);border-radius:8px;color:#c7d5e6;padding:8px 18px}
+.etf-asset-tabs button.active{background:rgba(55,231,189,.13);border-color:#37e7bd;color:#37e7bd}
+.etf-issuer-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 18px}
+.etf-issuer-row,.etf-history-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid rgba(126,151,181,.12)}
+.etf-issuer-row span{display:flex;gap:10px;align-items:center}.etf-issuer-row small{color:#9baec5;font-size:12px}.etf-issuer-row strong,.etf-history-row b{white-space:nowrap}
+.etf-history{margin:18px 0}.etf-history>strong{display:block;margin-bottom:8px}.etf-history-row{font-size:13px}
+@media(max-width:750px){.etf-asset-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.etf-issuer-list{grid-template-columns:1fr}}
