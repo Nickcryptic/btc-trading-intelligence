@@ -295,69 +295,7 @@ function renderAsset(asset){
 }
 
 let selectedEtf='BTC';
-const etfFlowFormat = v => typeof v==='number' && Number.isFinite(v) ? (v>0?'+':'')+'
-  try{
-    const response=await fetch('/api/state',{cache:'no-store'});
-    if(!response.ok)throw new Error('Server '+response.status);
-    current=await response.json();
-    // Do not block live feed display on slow historical reconciliation.
-    const asset=current.assets?.[selected];
-    $('updated').textContent=shortTime(asset?.updated||current.updated);
-    $('updated-mini').textContent='Updated '+londonTime(asset?.updated);
-    const stale=asset&&Date.now()-Date.parse(asset.updated)>300000;
-    $('connection').textContent=stale?'● STALE DATA':asset?'● FEEDS ONLINE':'● FEEDS PENDING';
-    $('connection').className='live-badge'+(stale?' stale':asset?' online':'');
-    if(asset)renderAsset(asset);
-    else{
-      $('signal-status').textContent='AWAITING DATA';
-      $('signal-reason').textContent=current.source_errors?.[selected]||'Waiting for the first completed exchange refresh.';
-      renderCoverage(null);
-      renderLiquidity(null,true);
-    }
-    renderHistory();
-    renderEtf();
-    reconcileBrowserHistory().then(()=>renderSignalLog()).catch(()=>{});
-  }catch(error){
-    $('connection').textContent='● CONNECTION ERROR';
-    $('connection').className='live-badge stale';
-    $('feed-note').textContent=error.message;
-  }
-}
-document.querySelectorAll('[data-symbol]').forEach(button=>button.addEventListener('click',()=>{
-  selected=button.dataset.symbol;
-  document.querySelectorAll('[data-symbol]').forEach(x=>x.classList.toggle('active',x===button));
-  const asset=current?.assets?.[selected];
-  if(asset){renderAsset(asset);renderHistory();$('updated-mini').textContent='Updated '+londonTime(asset.updated)}else load();
-}));
-document.querySelectorAll('[data-fvg-tf]').forEach(button=>button.addEventListener('click',()=>{
-  selectedFvg=button.dataset.fvgTf;
-  document.querySelectorAll('[data-fvg-tf]').forEach(x=>{const active=x===button;x.classList.toggle('active',active);x.setAttribute('aria-pressed',String(active))});
-  const asset=current?.assets?.[selected];if(asset)renderZones(asset);
-}));
-// Mobile browsers suspend JavaScript timers when the tab/app is backgrounded.
-// Resume with an immediate fetch on every return, not the next 2-minute tick.
-// The server continues its own refresh loop while the Render instance is awake.
-let lastFeedRequestAt=0;
-let resumeRequestInFlight=false;
-async function resumeFeed(){
-  if(document.hidden||resumeRequestInFlight)return;
-  // Focus + pageshow + visibilitychange may fire together; coalesce them.
-  if(Date.now()-lastFeedRequestAt<1500)return;
-  resumeRequestInFlight=true;
-  lastFeedRequestAt=Date.now();
-  try{await load()}finally{resumeRequestInFlight=false}
-}
-$('reload').addEventListener('click',()=>{lastFeedRequestAt=0;resumeFeed()});
-load();
-setInterval(()=>{if(!document.hidden)resumeFeed()},120000);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)resumeFeed()});
-window.addEventListener('pageshow',()=>resumeFeed());
-window.addEventListener('focus',()=>resumeFeed());
-window.addEventListener('online',()=>resumeFeed());
-// A short foreground watchdog handles browsers that skip resume events.
-// It does not poll while the dashboard is hidden.
-setInterval(()=>{if(!document.hidden&&Date.now()-lastFeedRequestAt>=120000)resumeFeed()},15000);
-+v.toLocaleString('en-US',{minimumFractionDigits:1,maximumFractionDigits:1})+'M' : 'PENDING';
+const etfFlowFormat = v => typeof v==='number' && Number.isFinite(v) ? (v>0?'+':'')+v.toLocaleString('en-US',{minimumFractionDigits:1,maximumFractionDigits:1})+'M' : 'PENDING';
 function renderEtf(){
   const etf=current?.etf||{}, assets=etf.assets||{};
   const status=$('etf-status'); if(!status)return;
