@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.9.8'
+STRATEGY_VERSION = '0.9.9'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -893,10 +893,23 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=Non
     flow_support=(imbalance is not None and trade_imbalance is not None and imbalance*side>=0.08 and trade_imbalance*side>=0.08)
     flow_opposes=(imbalance is not None and trade_imbalance is not None and imbalance*side < -0.18 and trade_imbalance*side < -0.18)
     structure_break=(last['close']>max(c['high'] for c in c15[-5:-1]) if side==1 else last['close']<min(c['low'] for c in c15[-5:-1]))
-    pattern_confirmed=trigger!='NONE' and (structure_break or flow_support or ratio>=1.15)
+    # Completed-candle continuation is valid without demanding an additional fresh
+    # breakout or an unrelated order-book snapshot on every 15M bar.
+    continuation_confirmed=(trigger=='15M MOMENTUM CONTINUATION' and
+                            fifteen==side and hour_move==side and
+                            sum((c['close']-c['open'])*side>0 for c in c15[-4:])>=3 and
+                            ratio>=0.65)
+    impulse_confirmed_price=(impulse_side==side and fifteen==side and
+                             hour_move==side and
+                             abs(price-last['close'])<=0.9*a and
+                             ratio>=0.65)
+    pattern_confirmed=trigger!='NONE' and (structure_break or flow_support or
+                       ratio>=1.15 or continuation_confirmed or impulse_confirmed_price)
     reversal_confirmed=hourly_reversal==side and fifteen==side and (structure_break or flow_support)
-    impulse_confirmed=(impulse_side==side and fifteen==side and hour_move==side and structure_break)
-    anchor=(hour==side and (four==side or fifteen==side)) or reversal_confirmed or impulse_confirmed
+    impulse_confirmed=(impulse_side==side and fifteen==side and hour_move==side and
+                       (structure_break or impulse_confirmed_price))
+    continuation_anchor=(hour==side and fifteen==side and continuation_confirmed)
+    anchor=(hour==side and (four==side or fifteen==side)) or reversal_confirmed or impulse_confirmed or continuation_anchor
     # Safety checks are vetoes; volume and a perfect 1D alignment are not.
     counter_hourly_reversal=hourly_reversal==-side
     volatility=0.06<=a/price*100<=2.8
@@ -904,7 +917,9 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=Non
     # Permit a fresh impulse only near the last completed candle close;
     # never chase an already extended move far from the 15M mean.
     impulse_near=(impulse_side==side and abs(price-last['close'])<=0.75*a and abs(price-e21)<=5.0*a)
-    not_chasing=abs(price-last['close'])<=1.6*a and (abs(price-e21)<=3.8*a or impulse_near)
+    continuation_near=(continuation_confirmed and abs(price-last['close'])<=0.8*a and
+                       abs(price-e21)<=4.6*a)
+    not_chasing=abs(price-last['close'])<=1.6*a and (abs(price-e21)<=3.8*a or impulse_near or continuation_near)
     not_exhausted=16<r15<86
     def plan(entry):
         swing=(min(c['low'] for c in c15[-7:]) if side==1 else
@@ -956,6 +971,8 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=Non
         if flow_opposes:blockers.append('order flow opposes this trade')
         if not (spread_ok and volatility and not_chasing and not_exhausted):blockers.append('spread / volatility / chase filter')
         if not risk_ok:blockers.append('stop geometry')
+        if not volatility:blockers.append('ATR volatility outside safe range')
+        if not spread_ok:blockers.append('spread unavailable or too wide')
         result['reason']=f'Conditional {result["watch_direction"]} above/below ${watch_entry:,.2f}; waiting: '+', '.join(blockers)+'.'
     return result
 
