@@ -201,23 +201,23 @@ function renderLiquidity(asset,stale){
 try {
   for(let i=localStorage.length-1;i>=0;i--){
     const key=localStorage.key(i);
-    if(key&&key.startsWith('btc-intel-signal-journal-')&&!key.startsWith('btc-intel-signal-journal-v090-'))
+    if(key&&key.startsWith('btc-intel-signal-journal-')&&!key.startsWith('btc-intel-signal-journal-v091-'))
       localStorage.removeItem(key);
   }
 }catch{/* private browsing */}
-const journalKey = symbol => 'btc-intel-signal-journal-v090-'+symbol;
-const currentJournalVersion = '0.9.0';
+const journalKey = symbol => 'btc-intel-signal-journal-v091-'+symbol;
+const currentJournalVersion = '0.9.1';
 const signalId = row => String(row.ts)+'|'+String(row.entry)+'|'+String(row.side);
 function cachedSignalRows(symbol){
   let cached=[];
   try{cached=JSON.parse(localStorage.getItem(journalKey(symbol))||'[]');if(!Array.isArray(cached))cached=[]}catch{cached=[]}
-  return cached.filter(row=>row.strategy_version === '0.9.0').slice(0,5);
+  return cached.filter(row=>['0.9.0','0.9.1'].includes(row.strategy_version)).slice(0,5);
 }
 function storeSignalRows(symbol,rows){
   try{localStorage.setItem(journalKey(symbol),JSON.stringify(rows))}catch{/* privacy mode may block storage */}
 }
 function signalLogRows(){
-  const fresh=(current?.signal_log?.[selected]||[]).filter(row=>row.strategy_version === '0.9.0');
+  const fresh=(current?.signal_log?.[selected]||[]).filter(row=>['0.9.0','0.9.1'].includes(row.strategy_version));
   const cached=cachedSignalRows(selected);
   const ids=new Set();
   const merged=[...fresh,...cached].filter(row=>{
@@ -230,7 +230,7 @@ function signalLogRows(){
 }
 async function reconcileBrowserHistory(){
   await Promise.all(['BTCUSDT','ETHUSDT'].map(async symbol=>{
-    const fresh=(current?.signal_log?.[symbol]||[]).filter(row=>row.strategy_version === '0.9.0');
+    const fresh=(current?.signal_log?.[symbol]||[]).filter(row=>['0.9.0','0.9.1'].includes(row.strategy_version));
     const cached=cachedSignalRows(symbol);
     const freshIds=new Set(fresh.map(signalId));
     const orphan=cached.filter(row=>!freshIds.has(signalId(row))).slice(0,5);
