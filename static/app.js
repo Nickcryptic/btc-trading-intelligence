@@ -117,11 +117,11 @@ function renderZones(asset){
   $('fvg').innerHTML=opened.length?opened.map(z=>
     '<div class="zone-row"><div><b>'+(z.kind==='bullish'?'Bullish imbalance':'Bearish imbalance')+'</b><small>'+usd(z.low)+' — '+usd(z.high)+' · '+utcTime(z.at?new Date(z.at).toISOString():null)+' UTC</small></div><span class="direction '+(z.kind==='bullish'?'bull':'bear')+'">'+(z.kind==='bullish'?'BULLISH':'BEARISH')+'</span></div>'
   ).join(''):'<p class="placeholder">No open zones in the available completed '+selectedFvg.toUpperCase()+' candles.</p>';
-  $('fvg-note').textContent='Scanning the last '+zones.length+' detected 3-candle gaps on completed '+selectedFvg.toUpperCase()+' spot candles. Selection does not change the 15M-based signal score.';
+  $('fvg-note').textContent='Scanning the last '+zones.length+' detected 3-candle gaps on completed '+selectedFvg.toUpperCase()+' futures candles. Selection does not change the 15M-based signal score.';
 }
 function renderOrderBook(asset){
   const book=asset.order_book;
-  $('book-source').textContent=book?(asset.market_source||'Spot')+' · nearest 100 levels/side · '+shortTime(asset.updated):'Spot depth is unavailable';
+  $('book-source').textContent=book?(asset.market_source||'Spot')+' · nearest 100 levels/side · '+shortTime(asset.updated):'Futures depth is unavailable';
   if(!book){
     $('depth-summary').innerHTML='<p class="placeholder">No verified order-book snapshot from this feed.</p>';
     $('bid-ladder').innerHTML='';$('ask-ladder').innerHTML='';
@@ -201,23 +201,23 @@ function renderLiquidity(asset,stale){
 try {
   for(let i=localStorage.length-1;i>=0;i--){
     const key=localStorage.key(i);
-    if(key&&key.startsWith('btc-intel-signal-journal-')&&!key.startsWith('btc-intel-signal-journal-v086-')&&!key.startsWith('btc-intel-signal-journal-v085-'))
+    if(key&&key.startsWith('btc-intel-signal-journal-')&&!key.startsWith('btc-intel-signal-journal-v090-'))
       localStorage.removeItem(key);
   }
 }catch{/* private browsing */}
-const journalKey = symbol => 'btc-intel-signal-journal-v086-'+symbol;
-const currentJournalVersion = '0.8.6';
+const journalKey = symbol => 'btc-intel-signal-journal-v090-'+symbol;
+const currentJournalVersion = '0.9.0';
 const signalId = row => String(row.ts)+'|'+String(row.entry)+'|'+String(row.side);
 function cachedSignalRows(symbol){
   let cached=[];
-  try{cached=[...(JSON.parse(localStorage.getItem(journalKey(symbol))||'[]')),...(JSON.parse(localStorage.getItem('btc-intel-signal-journal-v085-'+symbol)||'[]'))];if(!Array.isArray(cached))cached=[]}catch{cached=[]}
-  return cached.filter(row=>['0.8.5','0.8.6'].includes(row.strategy_version)).slice(0,5);
+  try{cached=JSON.parse(localStorage.getItem(journalKey(symbol))||'[]');if(!Array.isArray(cached))cached=[]}catch{cached=[]}
+  return cached.filter(row=>row.strategy_version === '0.9.0').slice(0,5);
 }
 function storeSignalRows(symbol,rows){
   try{localStorage.setItem(journalKey(symbol),JSON.stringify(rows))}catch{/* privacy mode may block storage */}
 }
 function signalLogRows(){
-  const fresh=(current?.signal_log?.[selected]||[]).filter(row=>['0.8.5','0.8.6'].includes(row.strategy_version));
+  const fresh=(current?.signal_log?.[selected]||[]).filter(row=>row.strategy_version === '0.9.0');
   const cached=cachedSignalRows(selected);
   const ids=new Set();
   const merged=[...fresh,...cached].filter(row=>{
@@ -230,7 +230,7 @@ function signalLogRows(){
 }
 async function reconcileBrowserHistory(){
   await Promise.all(['BTCUSDT','ETHUSDT'].map(async symbol=>{
-    const fresh=(current?.signal_log?.[symbol]||[]).filter(row=>['0.8.5','0.8.6'].includes(row.strategy_version));
+    const fresh=(current?.signal_log?.[symbol]||[]).filter(row=>row.strategy_version === '0.9.0');
     const cached=cachedSignalRows(symbol);
     const freshIds=new Set(fresh.map(signalId));
     const orphan=cached.filter(row=>!freshIds.has(signalId(row))).slice(0,5);
