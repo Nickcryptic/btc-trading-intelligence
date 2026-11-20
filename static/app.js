@@ -331,7 +331,26 @@ document.querySelectorAll('[data-fvg-tf]').forEach(button=>button.addEventListen
   document.querySelectorAll('[data-fvg-tf]').forEach(x=>{const active=x===button;x.classList.toggle('active',active);x.setAttribute('aria-pressed',String(active))});
   const asset=current?.assets?.[selected];if(asset)renderZones(asset);
 }));
-$('reload').addEventListener('click',load);
+// Mobile browsers suspend JavaScript timers when the tab/app is backgrounded.
+// Resume with an immediate fetch on every return, not the next 2-minute tick.
+// The server continues its own refresh loop while the Render instance is awake.
+let lastFeedRequestAt=0;
+let resumeRequestInFlight=false;
+async function resumeFeed(){
+  if(document.hidden||resumeRequestInFlight)return;
+  // Focus + pageshow + visibilitychange may fire together; coalesce them.
+  if(Date.now()-lastFeedRequestAt<1500)return;
+  resumeRequestInFlight=true;
+  lastFeedRequestAt=Date.now();
+  try{await load()}finally{resumeRequestInFlight=false}
+}
+$('reload').addEventListener('click',()=>{lastFeedRequestAt=0;resumeFeed()});
 load();
-setInterval(()=>{if(!document.hidden)load()},120000);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)load()});
+setInterval(()=>{if(!document.hidden)resumeFeed()},120000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)resumeFeed()});
+window.addEventListener('pageshow',()=>resumeFeed());
+window.addEventListener('focus',()=>resumeFeed());
+window.addEventListener('online',()=>resumeFeed());
+// A short foreground watchdog handles browsers that skip resume events.
+// It does not poll while the dashboard is hidden.
+setInterval(()=>{if(!document.hidden&&Date.now()-lastFeedRequestAt>=120000)resumeFeed()},15000);
