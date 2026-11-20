@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.9.7'
+STRATEGY_VERSION = '0.9.8'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -848,8 +848,29 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=Non
         pts+=5 if daily==side else 0
         return pts,p
 
+    # v0.9.8: volatility-adjusted impulse detection, using CLOSED candles only.
+    # An impulse is a candidate, not a guaranteed entry; extended moves stay WATCH.
+    impulse_side=0
+    impulse_strength=0.0
+    if len(c15)>=9 and len(c1)>=5:
+        move_1h=(v15[-1]-v15[-5])/a
+        move_2h=(v15[-1]-v15[-9])/a
+        impulse_side=1 if move_1h>=2.0 and move_2h>=2.8 else -1 if move_1h<=-2.0 and move_2h<=-2.8 else 0
+        if impulse_side:
+            matching=sum((c['close']-c['open'])*impulse_side>0 for c in c15[-5:])
+            if matching<3 or (v1[-1]-v1[-3])*impulse_side<=0:
+                impulse_side=0
+            else:
+                impulse_strength=round(abs(move_1h),2)
+
     long_score,long_pattern=score(1)
     short_score,short_pattern=score(-1)
+    if impulse_side==1:
+        long_score+=20
+        if long_pattern=='NONE':long_pattern='15M RAPID UPSIDE IMPULSE'
+    elif impulse_side==-1:
+        short_score+=20
+        if short_pattern=='NONE':short_pattern='15M RAPID DOWNSIDE IMPULSE'
     # Do not prefer an old bearish regime over a clear six-hour bullish reversal.
     if hourly_reversal==1:
         short_score=max(0,short_score-35)
@@ -874,12 +895,16 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=Non
     structure_break=(last['close']>max(c['high'] for c in c15[-5:-1]) if side==1 else last['close']<min(c['low'] for c in c15[-5:-1]))
     pattern_confirmed=trigger!='NONE' and (structure_break or flow_support or ratio>=1.15)
     reversal_confirmed=hourly_reversal==side and fifteen==side and (structure_break or flow_support)
-    anchor=(hour==side and (four==side or fifteen==side)) or reversal_confirmed
+    impulse_confirmed=(impulse_side==side and fifteen==side and hour_move==side and structure_break)
+    anchor=(hour==side and (four==side or fifteen==side)) or reversal_confirmed or impulse_confirmed
     # Safety checks are vetoes; volume and a perfect 1D alignment are not.
     counter_hourly_reversal=hourly_reversal==-side
     volatility=0.06<=a/price*100<=2.8
     spread_ok=spread is not None and math.isfinite(spread) and 0<=spread<=5
-    not_chasing=abs(price-last['close'])<=1.6*a and abs(price-e21)<=3.8*a
+    # Permit a fresh impulse only near the last completed candle close;
+    # never chase an already extended move far from the 15M mean.
+    impulse_near=(impulse_side==side and abs(price-last['close'])<=0.75*a and abs(price-e21)<=5.0*a)
+    not_chasing=abs(price-last['close'])<=1.6*a and (abs(price-e21)<=3.8*a or impulse_near)
     not_exhausted=16<r15<86
     def plan(entry):
         swing=(min(c['low'] for c in c15[-7:]) if side==1 else
@@ -905,7 +930,8 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=Non
     risk_ok=active is not None
     required_ok=anchor and pattern_confirmed and not flow_opposes and not counter_hourly_reversal and spread_ok and volatility and not_chasing and not_exhausted and risk_ok
     checks=[
-        {'label':'4H trend', 'ok':four==side,'detail':'ALIGNED' if four==side else 'COUNTERTREND'},
+        {'label':'4H trend', 'ok':four==side or impulse_confirmed,'detail':'IMPULSE OVERRIDE' if impulse_confirmed and four!=side else 'ALIGNED' if four==side else 'COUNTERTREND'},
+        {'label':'Rapid impulse', 'ok':impulse_confirmed,'detail':f'{impulse_strength:.1f} ATR / 1H' if impulse_confirmed else 'NOT CONFIRMED'},
         {'label':'1H execution trend','ok':hour==side,'detail':'ALIGNED' if hour==side else 'MIXED'},
         {'label':'15M price action','ok':trigger!='NONE','detail':trigger if trigger!='NONE' else 'DEVELOPING'},
         {'label':'15M participation','ok':ratio>=0.7,'detail':f'{ratio:.2f}× median · bonus only'},
