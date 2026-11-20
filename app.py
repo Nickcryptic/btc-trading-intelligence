@@ -25,7 +25,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.9.0'
+STRATEGY_VERSION = '0.9.1'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1118,8 +1118,8 @@ async def fetch_asset_kraken_futures(client,symbol,macro=None):
         raise RuntimeError('Kraken Futures core feed unavailable: '+
                            ', '.join(str(x)[:70] for x in responses[:6] if isinstance(x,Exception)))
     k15,k1,k4,kd=[parse_kraken_futures_candles(x) for x in responses[:4]]
-    if min(len(k15),len(k1),len(k4),len(kd))<202:
-        raise RuntimeError('Kraken Futures insufficient completed candle history for 200D analysis')
+    if min(len(k15),len(k1),len(k4))<71 or len(kd)<201:
+        raise RuntimeError(f'Kraken Futures insufficient history: 15m={len(k15)}, 1h={len(k1)}, 4h={len(k4)}, 1d={len(kd)}; need 71 intraday and 201 daily')
     ticker_row=next((x for x in responses[4].get('tickers',[]) if x.get('symbol')==contract),None)
     if not ticker_row or ticker_row.get('last') is None:
         raise RuntimeError('Kraken Futures perpetual ticker unavailable')
