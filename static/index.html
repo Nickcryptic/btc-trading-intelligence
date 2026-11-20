@@ -6,11 +6,11 @@
   <meta name="theme-color" content="#08111f">
   <meta name="description" content="BTC and ETH market confluence dashboard with market bias, trading timing, research signals, and transparent sources.">
   <title>BTC Intelligence | Confluence Terminal</title>
-  <link rel="stylesheet" href="/static/style.css?v=0.8.6">
+  <link rel="stylesheet" href="/static/style.css?v=0.9.4">
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.8.6</i></small></div></div>
+  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.9.4</i></small></div></div>
   <div class="top-right"><span class="live-badge" id="connection" role="status">● CONNECTING</span><div class="refresh-detail"><span class="refresh-label">2 MIN AUTO REFRESH</span><small id="updated-mini">Updated: awaiting feed</small></div><button id="reload" class="icon-button" aria-label="Refresh market data">↻</button></div>
 </header>
 <main>
@@ -20,7 +20,7 @@
   </section>
 
   <section class="market-strip" aria-label="Market status">
-    <div class="strip-item"><span>SPOT REFERENCE</span><b id="market-price">—</b><small id="market-source">Connecting market feed</small></div>
+    <div class="strip-item"><span>FUTURES REFERENCE</span><b id="market-price">—</b><small id="market-source">Connecting market feed</small></div>
     <div class="strip-item"><span>24H MOVEMENT</span><b id="market-change">—</b><small>Approximate when using Kraken candles</small></div>
     <div class="strip-item"><span>DATA COVERAGE</span><b id="coverage-count">— / 23</b><small>Verified or explicitly partial categories</small></div>
     <div class="strip-item"><span>LAST MARKET CHECK</span><b id="updated">Waiting…</b><small id="feed-note">Refreshes while this free server is awake</small></div>
@@ -70,7 +70,7 @@
     <div class="plan-bottom"><span class="plan-icon">◎</span><span id="plan-reason">No levels until a research confluence is present.</span><span class="plan-mode">SIMULATION / NOT EXECUTABLE</span></div>
     <div class="trade-log-wrap">
       <div class="trade-log-title"><div><span class="eyebrow">TEST SIGNAL JOURNAL</span><h3>Latest 5 signal entries <span id="signal-log-symbol">BTC</span></h3></div><span class="badge">UTC · OBSERVED PRICES</span></div>
-      <p class="muted-detail">v0.8.6 uses weighted 4H/1H trend, 15M breakout/pullback/continuation, volume as supporting evidence and strict market/stop safeguards. The journal records only active PAPER setups, not WATCH plans. Each entry is rate-limited to avoid repeated two-minute signals. Outcomes are sampled prices, not executed fills or proven profit.</p>
+      <p class="muted-detail">v0.9.4 uses weighted 4H/1H trend, 15M breakout/pullback/continuation, volume as supporting evidence and strict market/stop safeguards. The journal records only active PAPER setups, not WATCH plans. Each entry is rate-limited to avoid repeated two-minute signals. Outcomes are sampled prices, not executed fills or proven profit.</p>
       <div class="trade-log-scroll"><table class="trade-log-table"><thead><tr><th>Issued (UTC)</th><th>Side</th><th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>Stop</th><th>Observed result</th></tr></thead><tbody id="signal-log"><tr><td colspan="8">Waiting for first test signal…</td></tr></tbody></table></div>
     </div>
   </section>
@@ -136,7 +136,7 @@
 
   <section class="history-grid">
     <article class="lower-card">
-      <div class="section-heading compact"><div><p class="eyebrow">10 / OBSERVATIONS</p><h2>Last 10 research snapshots</h2><p>Five-minute decisions while the server is active.</p></div><span class="badge">PAPER LOG</span></div>
+      <div class="section-heading compact"><div><p class="eyebrow">10 / OBSERVATIONS</p><h2>Last 10 research snapshots</h2><p>Server-side decisions while the service is active.</p></div><span class="badge">PAPER LOG</span></div>
       <div id="decision-history" class="history-list"><p class="placeholder">Waiting for first observation…</p></div>
     </article>
     <article class="lower-card">
@@ -147,8 +147,20 @@
     </article>
   </section>
 
-  <footer><div><strong>BTC INTELLIGENCE <span>v0.8.6</span></strong><p>Research software • candle-level observations, not brokerage fills • no Telegram alerts. Strategy unvalidated.</p></div><div>Free Render history can reset on redeploy; the exchange exposes only limited 1M history. Any unverifiable periods are flagged. <b>Not financial advice.</b></div></footer>
+
+  <section class="etf-monitor" aria-label="US spot crypto ETF fund flows">
+    <article class="lower-card">
+      <div class="section-heading compact"><div><p class="eyebrow">12 / INSTITUTIONAL FLOWS</p><h2>US spot crypto ETF monitor</h2><p>Daily net fund creations/redemptions, not exchange trade executions. Independent of LONG/SHORT signals.</p></div><span class="badge" id="etf-status">LOADING</span></div>
+      <div class="etf-asset-grid" id="etf-asset-grid"><p class="placeholder">Fetching free public ETF flow tables…</p></div>
+      <div class="etf-issuer-head"><strong>Fund-level flow breakdown</strong><span id="etf-report-date">Awaiting report</span></div>
+      <div class="etf-asset-tabs" role="group" aria-label="ETF asset"><button type="button" data-etf-asset="BTC" class="active">BTC</button><button type="button" data-etf-asset="ETH">ETH</button><button type="button" data-etf-asset="SOL">SOL</button><button type="button" data-etf-asset="HYPE">HYPE</button></div>
+      <div id="etf-issuer-list" class="etf-issuer-list"><p class="placeholder">Waiting for verified issuer data…</p></div>
+      <div id="etf-history" class="etf-history"></div>
+      <p class="muted-detail" id="etf-source-note">Source: Farside Investors public tables. Updated every 30 minutes while server is awake. Some other assets lack a verified free feed; unavailable values are never displayed as zero.</p>
+    </article>
+  </section>
+  <footer><div><strong>BTC INTELLIGENCE <span>v0.9.4</span></strong><p>Research software • candle-level observations, not brokerage fills • no Telegram alerts. Strategy unvalidated.</p></div><div>Free Render history can reset on redeploy; the exchange exposes only limited 1M history. Any unverifiable periods are flagged. <b>Not financial advice.</b></div></footer>
 </main>
-<script src="/static/app.js?v=0.8.6"></script>
+<script src="/static/app.js?v=0.9.4"></script>
 </body>
 </html>
