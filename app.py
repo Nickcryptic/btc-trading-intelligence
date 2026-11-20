@@ -25,7 +25,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.9.1'
+STRATEGY_VERSION = '0.9.2'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1145,7 +1145,7 @@ async def fetch_asset_kraken_futures(client,symbol,macro=None):
                      funding,float(oi) if oi is not None else None,
                      spot_source='Kraken Futures perpetual',market_pair=contract,
                      macro=macro,fetched_at=fetched_at)
-    asset['liquidity_map']=build_broad_liquidity(None,symbol,book,price,
+    asset['liquidity_map']=build_broad_liquidity(RuntimeError('futures-only orderbook'),symbol,book,price,
                                                  'Kraken Futures perpetual · order book')
     asset['mark_price']=float(ticker_row['markPrice']) if ticker_row.get('markPrice') is not None else None
     asset['price_type']='LAST TRADE'
