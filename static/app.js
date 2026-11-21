@@ -276,6 +276,19 @@ function renderHistory(){
   $('wintermute-history').innerHTML='<p>Verified Wintermute wallet attribution and buy/sell order data are not publicly connected. These entries are observation checks only and never affect the scores.</p>'
     +(wintermute.length?wintermute.map(x=>'<div class="history-row"><span>'+shortTime(x.ts)+'</span><strong>'+htmlSafe(x.signal)+'</strong></div>').join(''):'');
 }
+function renderStrategies(asset,stale){
+  for(const name of ['scalper','swing']){
+    const d=asset.strategies?.[name];
+    const status=$(name+'-status'),reason=$(name+'-reason'),levels=$(name+'-levels');
+    if(!status||!reason||!levels)continue;
+    const active=!stale&&d&&['LONG CANDIDATE','SHORT CANDIDATE'].includes(d.direction)&&d.levels;
+    status.textContent=stale?'FEED STALE':!d?'DATA UNAVAILABLE':active?'PAPER '+d.direction.split(' ')[0]:'NO QUALIFIED ENTRY';
+    status.className='strategy-status '+(active?(d.direction.startsWith('LONG')?'long':'short'):'');
+    reason.textContent=stale?'Feed stale: no new paper entry.':(d?.reason||'Strategy data unavailable.');
+    const l=active?d.levels:null;
+    levels.innerHTML=l?['entry','stop','tp1','tp2','tp3'].map(k=>'<div><span>'+k.toUpperCase()+'</span><strong>'+htmlSafe(usd(l[k]))+'</strong></div>').join(''):'<span>ENTRY — · SL — · TP —</span>';
+  }
+}
 function renderAsset(asset){
   const stale=Date.now()-Date.parse(asset.updated)>300000;
   $('market-price').textContent=usd(asset.price);
@@ -286,6 +299,7 @@ function renderAsset(asset){
   $('resistance').textContent=usd(asset.resistance);
   $('feed-note').textContent=stale?'Market readings are older than 5 minutes':'Auto-refresh runs when this free instance is awake';
   renderDecision(asset,stale);
+  renderStrategies(asset,stale);
   renderIndicators(asset);
   renderZones(asset);
   renderOrderBook(asset);
