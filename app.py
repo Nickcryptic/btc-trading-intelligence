@@ -1124,6 +1124,42 @@ def scalper_decision(one_minute, price, spread, imbalance=None, trade_imbalance=
 def attach_strategies(asset,one_minute,k15,k1h,k4h,kd,spread,imbalance=None,trade_imbalance=None):
     # Existing 15M/1H/4H strategy retained and independently reported as Swing.
     swing=professional_decision(k15,k1h,k4h,kd,asset['price'],spread,None,imbalance,trade_imbalance)
+    # Swing fallback: independently detect an early 15M structural shift, without
+    # requiring a lagging 1H EMA crossover. Still require a completed 1H momentum
+    # agreement and a defined non-chasing entry.
+    if swing.get('direction')=='NO TRADE' and len(k15)>35 and len(k1h)>12:
+        bars=k15[:-1];hours=k1h[:-1];a=atr(bars)
+        if a and a>0:
+            closes=[c['close'] for c in bars];e9=ema(closes,9);e21=ema(closes,21)
+            for side in (1,-1):
+                last=bars[-1]
+                pivot=max(c['high'] for c in bars[-13:-1]) if side==1 else min(c['low'] for c in bars[-13:-1])
+                breaking=(last['close']-pivot)*side>0.12*a
+                moving=(closes[-1]-closes[-5])*side>0.9*a and (e9-e21)*side>0
+                hourly=(hours[-1]['close']-hours[-4]['close'])*side>0
+                volume_base=median(c['volume'] for c in bars[-21:-1])
+                participation=last['volume']/volume_base if volume_base>0 else 0
+                near=abs(asset['price']-last['close'])<=0.7*a and abs(asset['price']-e21)<=4.0*a
+                swing_low=min(c['low'] for c in bars[-8:]) if side==1 else max(c['high'] for c in bars[-8:])
+                stop=min(swing_low-0.15*a,asset['price']-1.2*a) if side==1 else max(swing_low+0.15*a,asset['price']+1.2*a)
+                risk=abs(asset['price']-stop)
+                geometry=0.12<=100*risk/asset['price']<=2.0 and risk<=3.2*a
+                if breaking and moving and hourly and participation>=0.7 and near and geometry and spread is not None and 0<=spread<=5:
+                    entry=asset['price']
+                    levels={'entry':round(entry,2),'stop':round(stop,2),
+                            'tp1':round(entry+side*1.2*risk,2),
+                            'tp2':round(entry+side*2*risk,2),
+                            'tp3':round(entry+side*3*risk,2),
+                            'risk_pct':round(100*risk/entry,2),
+                            'status':'PAPER RESEARCH — NOT FILLED'}
+                    swing.update({'direction':'LONG CANDIDATE' if side==1 else 'SHORT CANDIDATE',
+                                  'levels':levels,'signal_score':75,'signal_grade':'MODERATE',
+                                  'trigger':'15M EARLY STRUCTURE SHIFT','signal_candle_ts':last['ts'],
+                                  'reason':'Early 15M break + 1H momentum; EMA crossover not required. Heuristic, unvalidated.',
+                                  'checks':[{'label':'Structure break','ok':True,'detail':'CONFIRMED'},
+                                            {'label':'1H momentum','ok':True,'detail':'ALIGNED'},
+                                            {'label':'Entry risk','ok':True,'detail':f'{levels["risk_pct"]:.2f}%'}]})
+                    break
     scalp=scalper_decision(one_minute,asset['price'],spread,imbalance,trade_imbalance)
     def pack(decision):
         return {key:decision.get(key) for key in ('direction','levels','signal_score','signal_grade',
