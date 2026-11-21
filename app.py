@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.11.0'
+STRATEGY_VERSION = '0.11.1'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1003,7 +1003,11 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=Non
     for side in (1,-1):
         # Two entry archetypes: fresh structural break, or pullback rejection
         # following a break within the last 8 completed bars.
-        prior=bars[-14:-2]
+        # Separate the older reference structure from the recent breakout window.
+        # Previously pivot included the same candles checked for recent_break:
+        # a close cannot exceed the maximum high of a window containing itself,
+        # so break/retest detection was effectively impossible.
+        prior=bars[-22:-9]
         pivot=max(x['high'] for x in prior) if side==1 else min(x['low'] for x in prior)
         fresh=(latest['close']-pivot)*side>0.10*a and (latest['close']-latest['open'])*side>0.35*a
         recent_break=any((x['close']-pivot)*side>0.10*a for x in bars[-8:-1])
