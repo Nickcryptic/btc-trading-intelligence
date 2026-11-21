@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.10.0'
+STRATEGY_VERSION = '0.11.0'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1049,6 +1049,89 @@ def professional_decision(k15,k1h,k4h,kd,price,spread,targets=None,imbalance=Non
     return legacy
 
 
+def scalper_decision(one_minute, price, spread, imbalance=None, trade_imbalance=None):
+    """Fast independent scalp model; only closed 1M bars, 5M aggregation, no HTF veto."""
+    result={'direction':'NO TRADE','levels':None,'signal_score':0,'signal_grade':'NONE',
+            'trigger':'NONE','reason':'Waiting for sufficient completed 1M candles.',
+            'signal_candle_ts':None,'checks':[],'watch_direction':None,'watch_levels':None}
+    if not one_minute or len(one_minute)<65 or not math.isfinite(price) or price<=0:
+        return result
+    bars=sorted(one_minute,key=lambda c:c['ts'])
+    # Require consecutive one-minute timestamps; otherwise no stale/partial-bar inference.
+    bars=bars[-120:]
+    if any(bars[i]['ts']-bars[i-1]['ts']!=60000 for i in range(max(1,len(bars)-35),len(bars))):
+        result['reason']='1M feed has missing candles; scalper signal suspended.'
+        return result
+    grouped={}
+    for c in bars:
+        key=c['ts']//300000
+        if key not in grouped:
+            grouped[key]={'ts':key*300000,'open':c['open'],'high':c['high'],'low':c['low'],
+                          'close':c['close'],'volume':c['volume'],'count':1}
+        else:
+            b=grouped[key];b['high']=max(b['high'],c['high']);b['low']=min(b['low'],c['low'])
+            b['close']=c['close'];b['volume']+=c['volume'];b['count']+=1
+    five=[x for x in grouped.values() if x['count']==5]
+    if len(five)<14:return result
+    a=atr(bars)
+    if not a or a<=0:return result
+    close=[c['close'] for c in bars]
+    fast=ema(close,9);slow=ema(close,21)
+    last=bars[-1];volbase=median(c['volume'] for c in bars[-31:-1])
+    relvol=last['volume']/volbase if volbase>0 else 0
+    five_move=five[-1]['close']-five[-4]['close']
+    candidates=[]
+    for side in (1,-1):
+        pivot=max(c['high'] for c in bars[-17:-1]) if side==1 else min(c['low'] for c in bars[-17:-1])
+        breakout=(last['close']-pivot)*side>=0.08*a and (last['close']-last['open'])*side>0.25*a
+        impulse=(close[-1]-close[-6])*side>=2.3*a and sum((c['close']-c['open'])*side>0 for c in bars[-5:])>=3
+        retest=(min(c['low'] for c in bars[-4:])<=fast if side==1 else max(c['high'] for c in bars[-4:])>=fast) and (last['close']-fast)*side>0.15*a
+        continuation=impulse and retest
+        if not (breakout or continuation):continue
+        momentum=(fast-slow)*side>0 and five_move*side>0
+        if not momentum:continue
+        proximity=abs(price-last['close'])<=0.85*a and abs(price-slow)<=4.8*a
+        spread_ok=spread is not None and math.isfinite(spread) and 0<=spread<=6
+        vol_ok=0.008<=100*a/price<=0.9
+        swing=min(c['low'] for c in bars[-9:]) if side==1 else max(c['high'] for c in bars[-9:])
+        stop=min(swing-0.2*a,price-1.5*a) if side==1 else max(swing+0.2*a,price+1.5*a)
+        risk=abs(price-stop)
+        geometry=0.035<=100*risk/price<=0.75 and risk<=4.5*a
+        flow_opposes=(imbalance is not None and trade_imbalance is not None and
+                      imbalance*side< -0.25 and trade_imbalance*side< -0.25)
+        score=35+20+(15 if breakout else 10)+(10 if relvol>=1.2 else 5)+(10 if impulse else 0)+(10 if retest else 0)
+        if not (proximity and spread_ok and vol_ok and geometry and not flow_opposes and relvol>=0.55 and score>=70):
+            continue
+        candidates.append((score,side,stop,risk,'1M BREAKOUT' if breakout else '1M IMPULSE RETEST'))
+    if not candidates:
+        result['reason']='No executable 1M breakout/retest with 5M momentum, acceptable spread, proximity and risk.'
+        return result
+    score,side,stop,risk,trigger=max(candidates,key=lambda x:x[0])
+    levels={'entry':round(price,2),'stop':round(stop,2),
+            'tp1':round(price+side*1.0*risk,2),'tp2':round(price+side*1.6*risk,2),
+            'tp3':round(price+side*2.2*risk,2),'risk_pct':round(100*risk/price,3),
+            'status':'PAPER RESEARCH — NOT FILLED'}
+    result.update({'direction':'LONG CANDIDATE' if side==1 else 'SHORT CANDIDATE',
+                   'levels':levels,'signal_score':score,'signal_grade':'HIGH' if score>=85 else 'MODERATE',
+                   'trigger':trigger,'signal_candle_ts':last['ts'],
+                   'reason':f'{trigger}: 1M price action + 5M momentum; {score}/100 heuristic evidence, not win probability.',
+                   'checks':[{'label':'1M structure','ok':True,'detail':trigger},
+                             {'label':'5M momentum','ok':True,'detail':'ALIGNED'},
+                             {'label':'Execution and risk','ok':True,'detail':f'{levels["risk_pct"]:.3f}% stop'}]})
+    return result
+
+
+def attach_strategies(asset,one_minute,k15,k1h,k4h,kd,spread,imbalance=None,trade_imbalance=None):
+    # Existing 15M/1H/4H strategy retained and independently reported as Swing.
+    swing=professional_decision(k15,k1h,k4h,kd,asset['price'],spread,None,imbalance,trade_imbalance)
+    scalp=scalper_decision(one_minute,asset['price'],spread,imbalance,trade_imbalance)
+    def pack(decision):
+        return {key:decision.get(key) for key in ('direction','levels','signal_score','signal_grade',
+                'trigger','reason','signal_candle_ts','checks','watch_direction','watch_levels','trigger_price')}
+    asset['strategies']={'scalper':pack(scalp),'swing':pack(swing)}
+    return asset
+
+
 def replay_recent_candles(k15,k1h,k4h,kd,round_trip_cost_bps=20):
     """Small, conservative OHLC sanity check, NOT an out-of-sample performance claim.
 
@@ -1272,6 +1355,11 @@ async def fetch_asset_kraken_futures(client,symbol,macro=None):
         asset['_observation_candles']=None
     else:
         asset['_observation_candles']=parse_kraken_futures_candles(responses[6])[:-1]
+    # Both strategies use the same verified futures price feed.
+    c=asset.get('_observation_candles')
+    bid=book['bids'][0][0];ask=book['asks'][0][0]
+    spread_bps=(float(ask)-float(bid))/price*10000
+    attach_strategies(asset,c,k15,k1,k4,kd,spread_bps)
     return asset
 
 
