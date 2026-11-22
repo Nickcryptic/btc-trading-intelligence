@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.12.2'
+STRATEGY_VERSION = '0.13.0'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1216,6 +1216,75 @@ def weighted_v12_decision(k15,k1h,price,spread,imbalance=None,trade_imbalance=No
     return result
 
 
+
+def independent_v13_decision(k15,k1h,k4h,price,spread,imbalance=None,trade_imbalance=None):
+    """Paper-only directional model. Missing optional flow cannot veto price action."""
+    result={'direction':'NO TRADE','levels':None,'signal_score':0,'signal_grade':'NONE',
+            'trigger':'NONE','reason':'Insufficient verified structure','signal_candle_ts':None,
+            'checks':[],'market_bias':'NEUTRAL','long_score':0,'short_score':0,
+            'blocked_reasons':[]}
+    if min(len(k15),len(k1h),len(k4h))<35 or not math.isfinite(price) or price<=0:
+        result['blocked_reasons']=['Missing candles or price'];return result
+    b=k15[:-1];h=k1h[:-1];four=k4h[:-1]
+    a=atr(b)
+    if not a or a<=0:
+        result['blocked_reasons']=['ATR unavailable'];return result
+    last=b[-1];cl=[x['close'] for x in b];hc=[x['close'] for x in h];fc=[x['close'] for x in four]
+    f=ema(cl,9);slow=ema(cl,21);hf=ema(hc,21);ff=ema(fc,21)
+    volume_base=median(x['volume'] for x in b[-25:-1])
+    rv=last['volume']/volume_base if volume_base>0 else 0
+    scores={}
+    for side,label in ((1,'LONG'),(-1,'SHORT')):
+        structure=(12 if (last['close']-slow)*side>0 else 0)+(10 if (last['close']-b[-7]['close'])*side>0.8*a else 0)+(8 if (last['close']-h[-5]['close'])*side>0 else 0)
+        volume=(12 if rv>=1.25 else 8 if rv>=0.8 else 3)+(8 if (last['close']-last['open'])*side>0 else 0)
+        flow=0
+        if imbalance is not None and math.isfinite(imbalance):
+            flow+=max(0,min(10,5+20*imbalance*side))
+        if trade_imbalance is not None and math.isfinite(trade_imbalance):
+            flow+=max(0,min(10,5+20*trade_imbalance*side))
+        momentum=(8 if (f-slow)*side>0 else 0)+(7 if (hc[-1]-hf)*side>0 else 0)
+        pivot=max(x['high'] for x in b[-13:-1]) if side==1 else min(x['low'] for x in b[-13:-1])
+        breakout=(last['close']-pivot)*side>0.1*a
+        reversal=(last['close']-b[-5]['close'])*side>1.0*a and (last['close']-f)*side>0
+        continuation=(f-slow)*side>0 and (hc[-1]-hf)*side>0
+        setup='BREAKOUT' if breakout else 'EARLY REVERSAL' if reversal else 'TREND CONTINUATION' if continuation else 'NO SETUP'
+        risk_stop=min(min(x['low'] for x in b[-8:])-.15*a,price-1.2*a) if side==1 else max(max(x['high'] for x in b[-8:])+.15*a,price+1.2*a)
+        risk=abs(price-risk_stop)
+        geometry=.10<=100*risk/price<=2.0 and risk<=3.5*a and abs(price-last['close'])<=1.0*a
+        entry=10 if geometry else 0
+        score=round(structure+volume+flow+momentum+entry)
+        scores[label]={'score':score,'setup':setup,'stop':risk_stop,'risk':risk,'geometry':geometry}
+    result.update(long_score=scores['LONG']['score'],short_score=scores['SHORT']['score'])
+    best=max(scores,key=lambda k:scores[k]['score'])
+    other='SHORT' if best=='LONG' else 'LONG'
+    result['market_bias']=best if scores[best]['score']-scores[other]['score']>=8 else 'NEUTRAL'
+    candidate=scores[best]
+    blocks=[]
+    if spread is None or not math.isfinite(spread) or spread>8 or spread<0:blocks.append('Spread unavailable or >8 bps')
+    if candidate['setup']=='NO SETUP':blocks.append('No confirmed 15M setup')
+    if not candidate['geometry']:blocks.append('Entry too far or stop geometry invalid')
+    if candidate['score']<55:blocks.append('Score below 55')
+    if candidate['score']-scores[other]['score']<8:blocks.append('Long/short conflict')
+    if rv<0.55:blocks.append('Participation below 0.55x')
+    result['blocked_reasons']=blocks
+    result['reason']=f'LONG {scores["LONG"]["score"]}/100; SHORT {scores["SHORT"]["score"]}/100; relative volume {rv:.2f}x. '+('; '.join(blocks) if blocks else 'Qualified paper setup')
+    if blocks:return result
+    side=1 if best=='LONG' else -1
+    risk=candidate['risk']
+    result.update({'direction':best+' CANDIDATE','signal_score':candidate['score'],
+                   'signal_grade':'HIGH' if candidate['score']>=75 else 'MODERATE',
+                   'trigger':'V13 '+candidate['setup'],'signal_candle_ts':last['ts'],
+                   'levels':{'entry':round(price,2),'stop':round(candidate['stop'],2),
+                             'tp1':round(price+side*1.2*risk,2),
+                             'tp2':round(price+side*2*risk,2),
+                             'tp3':round(price+side*3*risk,2),
+                             'risk_pct':round(100*risk/price,2),'status':'PAPER RESEARCH — NOT FILLED'},
+                   'checks':[{'label':'Independent price setup','ok':True,'detail':candidate['setup']},
+                             {'label':'Relative volume','ok':True,'detail':f'{rv:.2f}x'},
+                             {'label':'Spread and risk','ok':True,'detail':f'{spread:.2f} bps'}]})
+    return result
+
+
 def attach_strategies(asset,one_minute,k15,k1h,k4h,kd,spread,imbalance=None,trade_imbalance=None):
     # Existing 15M/1H/4H strategy retained and independently reported as Swing.
     swing=professional_decision(k15,k1h,k4h,kd,asset['price'],spread,None,imbalance,trade_imbalance)
@@ -1256,21 +1325,23 @@ def attach_strategies(asset,one_minute,k15,k1h,k4h,kd,spread,imbalance=None,trad
                                             {'label':'Entry risk','ok':True,'detail':f'{levels["risk_pct"]:.2f}%'}]})
                     break
     weighted=weighted_v12_decision(k15,k1h,asset['price'],spread,imbalance,trade_imbalance)
-    # Unified main decision: a qualified independent setup must reach the
-    # existing five-entry paper journal, not remain invisible in a side panel.
-    qualified=[d for d in (weighted,swing) if d.get('levels') and d.get('direction') in ('LONG CANDIDATE','SHORT CANDIDATE')]
-    if qualified:
-        selected=max(qualified,key=lambda d:d.get('signal_score') or 0)
-        asset.update({'direction':selected['direction'],'levels':selected['levels'],
-                      'signal_score':selected['signal_score'],'signal_grade':selected['signal_grade'],
-                      'signal_candle_ts':selected['signal_candle_ts'],
-                      'setup_trigger':selected['trigger'],'setup_reason':selected['reason'],
-                      'signal_checks':selected['checks'],'test_confirmation':True})
+    independent=independent_v13_decision(k15,k1h,k4h,asset['price'],spread,imbalance,trade_imbalance)
+    # V13 owns the primary paper journal. Legacy strategies remain visible as comparisons.
+    asset.update({'direction':independent['direction'],'levels':independent['levels'],
+                  'signal_score':independent['signal_score'],'signal_grade':independent['signal_grade'],
+                  'signal_candle_ts':independent['signal_candle_ts'],
+                  'setup_trigger':independent['trigger'],'setup_reason':independent['reason'],
+                  'signal_checks':independent['checks'],
+                  'test_confirmation':bool(independent['levels']),
+                  'market_bias_v13':independent['market_bias'],
+                  'long_score_v13':independent['long_score'],
+                  'short_score_v13':independent['short_score'],
+                  'signal_blockers_v13':independent['blocked_reasons']})
     scalp=scalper_decision(one_minute,asset['price'],spread,imbalance,trade_imbalance)
     def pack(decision):
         return {key:decision.get(key) for key in ('direction','levels','signal_score','signal_grade',
                 'trigger','reason','signal_candle_ts','checks','watch_direction','watch_levels','trigger_price')}
-    asset['strategies']={'scalper':pack(scalp),'swing':pack(swing),'weighted_v12':pack(weighted)}
+    asset['strategies']={'scalper':pack(scalp),'swing':pack(swing),'weighted_v12':pack(weighted),'independent_v13':pack(independent)}
     return asset
 
 
