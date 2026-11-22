@@ -6,11 +6,11 @@
   <meta name="theme-color" content="#08111f">
   <meta name="description" content="BTC and ETH market confluence dashboard with market bias, trading timing, research signals, and transparent sources.">
   <title>BTC Intelligence | Confluence Terminal</title>
-  <link rel="stylesheet" href="/static/style.css?v=0.11.1">
+  <link rel="stylesheet" href="/static/style.css?v=0.12.0">
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.11.1</i></small></div></div>
+  <div class="brand"><div class="mark">₿</div><div><strong>BTC <span>INTELLIGENCE</span></strong><small>CONFLUENCE TERMINAL <i>v0.12.0</i></small></div></div>
   <div class="top-right"><span class="live-badge" id="connection" role="status">● CONNECTING</span><div class="refresh-detail"><span class="refresh-label">2 MIN AUTO REFRESH</span><small id="updated-mini">Updated: awaiting feed</small></div><button id="reload" class="icon-button" aria-label="Refresh market data">↻</button></div>
 </header>
 <main>
@@ -81,7 +81,7 @@
     <div class="plan-bottom"><span class="plan-icon">◎</span><span id="plan-reason">No levels until a research confluence is present.</span><span class="plan-mode">SIMULATION / NOT EXECUTABLE</span></div>
     <div class="trade-log-wrap">
       <div class="trade-log-title"><div><span class="eyebrow">TEST SIGNAL JOURNAL</span><h3>Latest 5 signal entries <span id="signal-log-symbol">BTC</span></h3></div><span class="badge">UTC · OBSERVED PRICES</span></div>
-      <p class="muted-detail">v0.11.1 uses weighted 4H/1H trend, 15M breakout/pullback/continuation, volume as supporting evidence and strict market/stop safeguards. The journal records only active PAPER setups, not WATCH plans. Each entry is rate-limited to avoid repeated two-minute signals. Outcomes are sampled prices, not executed fills or proven profit.</p>
+      <p class="muted-detail">v0.12.0 uses weighted 4H/1H trend, 15M breakout/pullback/continuation, volume as supporting evidence and strict market/stop safeguards. The journal records only active PAPER setups, not WATCH plans. Each entry is rate-limited to avoid repeated two-minute signals. Outcomes are sampled prices, not executed fills or proven profit.</p>
       <div class="trade-log-scroll"><table class="trade-log-table"><thead><tr><th>Issued (UTC)</th><th>Side</th><th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>Stop</th><th>Observed result</th></tr></thead><tbody id="signal-log"><tr><td colspan="8">Waiting for first test signal…</td></tr></tbody></table></div>
     </div>
   </section>
@@ -170,8 +170,8 @@
       <p class="muted-detail" id="etf-source-note">Source: Farside Investors public tables. Updated every 30 minutes while server is awake. Some other assets lack a verified free feed; unavailable values are never displayed as zero.</p>
     </article>
   </section>
-  <footer><div><strong>BTC INTELLIGENCE <span>v0.11.1</span></strong><p>Research software • candle-level observations, not brokerage fills • no Telegram alerts. Strategy unvalidated.</p></div><div>Free Render history can reset on redeploy; the exchange exposes only limited 1M history. Any unverifiable periods are flagged. <b>Not financial advice.</b></div></footer>
+  <footer><div><strong>BTC INTELLIGENCE <span>v0.12.0</span></strong><p>Research software • candle-level observations, not brokerage fills • no Telegram alerts. Strategy unvalidated.</p></div><div>Free Render history can reset on redeploy; the exchange exposes only limited 1M history. Any unverifiable periods are flagged. <b>Not financial advice.</b></div></footer>
 </main>
-<script src="/static/app.js?v=0.11.1"></script>
+<script src="/static/app.js?v=0.12.0"></script>
 </body>
 </html>
