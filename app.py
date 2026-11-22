@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.11.1'
+STRATEGY_VERSION = '0.12.0'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1125,6 +1125,97 @@ def scalper_decision(one_minute, price, spread, imbalance=None, trade_imbalance=
     return result
 
 
+
+def weighted_v12_decision(k15,k1h,price,spread,imbalance=None,trade_imbalance=None):
+    """Four independent 15M setups; evidence coverage is explicit, not fabricated."""
+    result={'direction':'NO TRADE','levels':None,'signal_score':0,'signal_grade':'NONE',
+            'trigger':'NONE','reason':'No qualifying v0.12.0 setup.','signal_candle_ts':None,
+            'checks':[],'watch_direction':None,'watch_levels':None,'trigger_price':None,
+            'evidence_coverage':None}
+    if len(k15)<65 or len(k1h)<25 or price<=0:
+        result['reason']='Insufficient completed candles for v0.12.0.'
+        return result
+    bars=k15[:-1];hours=k1h[:-1];last=bars[-1]
+    a=atr(bars)
+    if not a or a<=0:return result
+    closes=[x['close'] for x in bars]
+    fast=ema(closes,9);slow=ema(closes,21)
+    hcloses=[x['close'] for x in hours]
+    hfast=ema(hcloses,21)
+    baseline=median(x['volume'] for x in bars[-25:-1])
+    relvol=last['volume']/baseline if baseline>0 else 0
+    # Snapshot depth is weak evidence; trade imbalance only if real trade prints exist.
+    order_available=imbalance is not None and math.isfinite(imbalance)
+    trade_available=trade_imbalance is not None and math.isfinite(trade_imbalance)
+    if spread is None or not math.isfinite(spread) or spread<0 or spread>6:
+        result['reason']='Execution blocked: spread missing or excessive.'
+        return result
+    candidates=[]
+    for side in (1,-1):
+        pivot=max(x['high'] for x in bars[-23:-9]) if side==1 else min(x['low'] for x in bars[-23:-9])
+        recent=bars[-8:-1]
+        broke=any((x['close']-pivot)*side>0.12*a for x in recent)
+        fresh=(last['close']-pivot)*side>0.12*a and (last['close']-last['open'])*side>0.25*a
+        pullback=(min(x['low'] for x in bars[-4:])<=fast if side==1 else max(x['high'] for x in bars[-4:])>=fast)
+        rejection=(last['close']-last['open'])*side>0.18*a and (last['close']-fast)*side>0
+        continuation=(fast-slow)*side>0 and (closes[-1]-closes[-5])*side>0.9*a and pullback and rejection
+        reversal=(closes[-1]-closes[-7])*side>1.6*a and (last['close']-fast)*side>0 and
+                  (last['close']-last['open'])*side>0.3*a and
+                  (hcloses[-1]-hcloses[-4])*side>0)
+        sweep=(last['low']<min(x['low'] for x in bars[-13:-1])-0.08*a and
+               last['close']>min(x['low'] for x in bars[-13:-1])+0.15*a if side==1 else
+               last['high']>max(x['high'] for x in bars[-13:-1])+0.08*a and
+               last['close']<max(x['high'] for x in bars[-13:-1])-0.15*a)
+        sweep=sweep and rejection
+        setups=[('TREND CONTINUATION',continuation),('EARLY REVERSAL',reversal),
+                ('BREAKOUT / RETEST',fresh or (broke and rejection)),
+                ('LIQUIDITY SWEEP REVERSAL',sweep)]
+        if not any(ok for _,ok in setups):continue
+        # Structure 25, momentum 20, volume 20, depth/trade flow 20,
+        # entry 10, derivatives 5 (unavailable => zero, never invented).
+        structure=25 if fresh or sweep else 20 if broke or continuation else 12
+        momentum=20 if (fast-slow)*side>0 and (hcloses[-1]-hcloses[-4])*side>0 else 14 if (closes[-1]-closes[-4])*side>0 else 7
+        volume=20 if relvol>=1.5 else 16 if relvol>=1.1 else 12 if relvol>=0.75 else 5
+        flow=0
+        if order_available:flow+=max(0,min(10,5+25*imbalance*side))
+        if trade_available:flow+=max(0,min(10,5+25*trade_imbalance*side))
+        # Missing order/trade evidence is missing, not bearish or bullish.
+        coverage=60+(10 if order_available else 0)+(10 if trade_available else 0)
+        swing=min(x['low'] for x in bars[-8:]) if side==1 else max(x['high'] for x in bars[-8:])
+        stop=min(swing-0.15*a,price-1.2*a) if side==1 else max(swing+0.15*a,price+1.2*a)
+        risk=abs(price-stop)
+        geometry=0.10<=100*risk/price<=2.0 and risk<=3.2*a
+        proximity=abs(price-last['close'])<=0.85*a and abs(price-slow)<=4.5*a
+        entry_score=10 if geometry and proximity else 0
+        score=round(structure+momentum+volume+flow+entry_score)
+        # Avoid trading on unverified depth: require real participation and
+        # 15M price structure, with at least one available flow source.
+        if not (geometry and proximity and relvol>=0.65 and
+                (order_available or trade_available) and score>=68):continue
+        setup=next(name for name,ok in setups if ok)
+        candidates.append((score,side,setup,stop,risk,coverage,relvol,flow))
+    if not candidates:
+        result['reason']='No setup passed structure, volume, evidence coverage, execution and risk checks.'
+        result['evidence_coverage']={'order_book':order_available,'trade_flow':trade_available}
+        return result
+    score,side,setup,stop,risk,coverage,relvol,flow=max(candidates,key=lambda x:x[0])
+    levels={'entry':round(price,2),'stop':round(stop,2),
+            'tp1':round(price+side*1.2*risk,2),'tp2':round(price+side*2*risk,2),
+            'tp3':round(price+side*3*risk,2),'risk_pct':round(100*risk/price,2),
+            'status':'PAPER RESEARCH — NOT FILLED'}
+    result.update({'direction':'LONG CANDIDATE' if side==1 else 'SHORT CANDIDATE',
+                   'levels':levels,'signal_score':score,
+                   'signal_grade':'HIGH' if score>=85 else 'MODERATE',
+                   'trigger':setup,'signal_candle_ts':last['ts'],
+                   'reason':f'v0.12.0 {setup}; relative volume {relvol:.2f}x; observed flow {flow:.1f}/20; {coverage}% evidence coverage. Heuristic score, not probability.',
+                   'checks':[{'label':'Structure and setup','ok':True,'detail':setup},
+                             {'label':'Relative volume','ok':True,'detail':f'{relvol:.2f}x'},
+                             {'label':'Order flow coverage','ok':order_available or trade_available,'detail':f'{flow:.1f}/20 observed'},
+                             {'label':'Execution geometry','ok':True,'detail':f'{levels["risk_pct"]:.2f}% risk'}],
+                   'evidence_coverage':{'order_book':order_available,'trade_flow':trade_available}})
+    return result
+
+
 def attach_strategies(asset,one_minute,k15,k1h,k4h,kd,spread,imbalance=None,trade_imbalance=None):
     # Existing 15M/1H/4H strategy retained and independently reported as Swing.
     swing=professional_decision(k15,k1h,k4h,kd,asset['price'],spread,None,imbalance,trade_imbalance)
@@ -1164,11 +1255,22 @@ def attach_strategies(asset,one_minute,k15,k1h,k4h,kd,spread,imbalance=None,trad
                                             {'label':'1H momentum','ok':True,'detail':'ALIGNED'},
                                             {'label':'Entry risk','ok':True,'detail':f'{levels["risk_pct"]:.2f}%'}]})
                     break
+    weighted=weighted_v12_decision(k15,k1h,asset['price'],spread,imbalance,trade_imbalance)
+    # Unified main decision: a qualified independent setup must reach the
+    # existing five-entry paper journal, not remain invisible in a side panel.
+    qualified=[d for d in (weighted,swing) if d.get('levels') and d.get('direction') in ('LONG CANDIDATE','SHORT CANDIDATE')]
+    if qualified:
+        selected=max(qualified,key=lambda d:d.get('signal_score') or 0)
+        asset.update({'direction':selected['direction'],'levels':selected['levels'],
+                      'signal_score':selected['signal_score'],'signal_grade':selected['signal_grade'],
+                      'signal_candle_ts':selected['signal_candle_ts'],
+                      'setup_trigger':selected['trigger'],'setup_reason':selected['reason'],
+                      'signal_checks':selected['checks'],'test_confirmation':True})
     scalp=scalper_decision(one_minute,asset['price'],spread,imbalance,trade_imbalance)
     def pack(decision):
         return {key:decision.get(key) for key in ('direction','levels','signal_score','signal_grade',
                 'trigger','reason','signal_candle_ts','checks','watch_direction','watch_levels','trigger_price')}
-    asset['strategies']={'scalper':pack(scalp),'swing':pack(swing)}
+    asset['strategies']={'scalper':pack(scalp),'swing':pack(swing),'weighted_v12':pack(weighted)}
     return asset
 
 
