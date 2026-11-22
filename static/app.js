@@ -18,7 +18,7 @@ const categories = [
   ['Fear & Greed','Fear & Greed'],
   ['Funding Rate','Funding Rate'],
   ['Open Interest / Leverage','Open Interest'],
-  ['Total BTC ETF Flows',null],
+  ['Total BTC ETF Flows','ETF_BTC_TOTAL'],
   ['Exchange Inflows / Outflows',null],
   ['MVRV Ratio',null],
   ['Stablecoin Supply (30D)','Stablecoin Supply (30D)'],
@@ -26,7 +26,7 @@ const categories = [
   ['US Dollar Index (DXY)',null],
   ['Nasdaq / US Equities',null],
   ['Bitcoin Halving Cycle','Bitcoin Halving Cycle'],
-  ['BlackRock IBIT ETF Flow',null],
+  ['BlackRock IBIT ETF Flow','ETF_IBIT'],
   ['Wintermute Orders · monitoring only',null],
   ['Whale BTC / ETH Transfers',null],
   ['USDT Minting / Redemption',null],
@@ -54,11 +54,15 @@ function renderCoverage(asset){
   const indicators=asset?.indicators || [];
   let count=0;
   const list=categories.map(([name,mapped],idx)=>{
-    const item=indicators.find(x=>x.name===mapped);
+    const etfBtc=current?.etf?.assets?.BTC;
+    const ibit=etfBtc?.funds?.find(f=>f.ticker==='IBIT');
+    const item=mapped==='ETF_IBIT'?(ibit&&typeof ibit.flow_musd==='number'?{signal:'VERIFIED'}:null):
+               mapped==='ETF_BTC_TOTAL'?(etfBtc&&typeof etfBtc.total_musd==='number'?{signal:'VERIFIED'}:null):
+               indicators.find(x=>x.name===mapped);
     const active=Boolean(item&&item.signal!=='UNAVAILABLE');
     const proxy=idx===19&&active;
     if(active)count++;
-    const status=active?(proxy?'PARTIAL · RECENT TRADES':'LIVE · VERIFIED SOURCE'):'NOT YET SOURCED';
+    const status=active?(mapped==='ETF_IBIT'?('IBIT '+etfFlowFormat(ibit.flow_musd)+' · '+etfBtc.date):mapped==='ETF_BTC_TOTAL'?('BTC '+etfFlowFormat(etfBtc.total_musd)+' · '+etfBtc.date):proxy?'PARTIAL · RECENT TRADES':'LIVE · VERIFIED SOURCE'):(mapped==='ETF_IBIT'?'IBIT DAILY FLOW PENDING':mapped==='ETF_BTC_TOTAL'?'BTC DAILY FLOW PENDING':'NOT YET SOURCED');
     return '<div class="coverage-row"><span>'+String(idx+1).padStart(2,'0')+' · '+htmlSafe(name)+'</span><b class="'+(active?'':'pending')+'">'+status+'</b></div>';
   }).join('');
   $('coverage-count').textContent=count+' / 23';
