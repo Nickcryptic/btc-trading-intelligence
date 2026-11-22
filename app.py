@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.12.0'
+STRATEGY_VERSION = '0.12.1'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1159,7 +1159,7 @@ def weighted_v12_decision(k15,k1h,price,spread,imbalance=None,trade_imbalance=No
         pullback=(min(x['low'] for x in bars[-4:])<=fast if side==1 else max(x['high'] for x in bars[-4:])>=fast)
         rejection=(last['close']-last['open'])*side>0.18*a and (last['close']-fast)*side>0
         continuation=(fast-slow)*side>0 and (closes[-1]-closes[-5])*side>0.9*a and pullback and rejection
-        reversal=(closes[-1]-closes[-7])*side>1.6*a and (last['close']-fast)*side>0 and
+        reversal=((closes[-1]-closes[-7])*side>1.6*a and (last['close']-fast)*side>0 and
                   (last['close']-last['open'])*side>0.3*a and
                   (hcloses[-1]-hcloses[-4])*side>0)
         sweep=(last['low']<min(x['low'] for x in bars[-13:-1])-0.08*a and
