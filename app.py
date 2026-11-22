@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.12.1'
+STRATEGY_VERSION = '0.12.2'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1806,6 +1806,56 @@ app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 
 @app.get('/')
 async def index(): return FileResponse(ROOT/'static'/'index.html',headers={'Cache-Control':'no-store, max-age=0, must-revalidate'})
+
+
+def validation_self_tests():
+    """Deterministic checks using the production observer and signal engine."""
+    from datetime import timedelta
+    issued=datetime(2026,11,20,12,0,30,tzinfo=timezone.utc)
+    base=int(issued.timestamp()*1000)//60000*60000
+    def row(side='LONG'):
+        return {'ts':issued.isoformat(),'side':side,'entry':100.,'stop':98. if side=='LONG' else 102.,
+                'tp1':102. if side=='LONG' else 98.,'tp2':104. if side=='LONG' else 96.,
+                'tp3':106. if side=='LONG' else 94.,'status':'PENDING ENTRY',
+                'checked_until_ms':None,'coverage':None}
+    def bar(i,lo,hi):
+        return {'ts':base+i*60000,'low':lo,'high':hi,'open':100.,'close':100.}
+    tests={}
+    def check(name,expected,actual):
+        tests[name]={'pass':actual==expected,'expected':expected,'actual':actual}
+    check('long_stop', 'SL SEEN',reconcile_signal(row(),[bar(1,99,101),bar(2,97,100)])['status'])
+    check('long_tp1','TP1 SEEN',reconcile_signal(row(),[bar(1,99,101),bar(2,100,103)])['status'])
+    check('long_tp3','TP3 SEEN',reconcile_signal(row(),[bar(1,99,101),bar(2,101,107)])['status'])
+    check('short_stop','SL SEEN',reconcile_signal(row('SHORT'),[bar(1,99,101),bar(2,100,103)])['status'])
+    check('short_tp2','TP2 SEEN',reconcile_signal(row('SHORT'),[bar(1,99,101),bar(2,95,99)])['status'])
+    check('same_bar_ambiguous','AMBIGUOUS SL/TP',reconcile_signal(row(),[bar(1,97,103)])['status'])
+    check('issuance_minute_excluded','PENDING ENTRY',reconcile_signal(row(),[bar(0,97,107),bar(1,105,107)])['status'])
+    check('no_fill','PENDING ENTRY',reconcile_signal(row(),[bar(1,103,105)])['status'])
+    gap=reconcile_signal(row(),[bar(2,99,101)])
+    check('gap_not_claimed_complete','GAP',gap['coverage'])
+    # A deterministic directional 15M impulse and hourly trend fixture;
+    # this is NOT historical performance or a reconstructed order book.
+    start=1_700_000_000_000//900000*900000
+    bars=[]
+    for i in range(100):
+        p=100+i*.07
+        if i>=96:p+= (i-95)*.9
+        bars.append({'ts':start+i*900000,'open':p-.3,'high':p+.5,'low':p-.6,
+                     'close':p,'volume':150 if i>=96 else 100})
+    hours=[{'ts':start-100*3600000+i*3600000,'open':98+i*.1,'high':99+i*.1,
+            'low':97+i*.1,'close':98+i*.1,'volume':100} for i in range(101)]
+    decision=weighted_v12_decision([*bars,dict(bars[-1])],[*hours,dict(hours[-1])],
+                                    bars[-1]['close'],1,0.25,0.25)
+    tests['weighted_engine_executes']={'pass':decision['direction'] in ('NO TRADE','LONG CANDIDATE','SHORT CANDIDATE'),
+                                       'actual':decision['direction'],'reason':decision['reason']}
+    return {'passed':sum(bool(v['pass']) for v in tests.values()),'total':len(tests),'tests':tests}
+
+
+@app.get('/api/validation')
+async def validation():
+    return {'version':STRATEGY_VERSION,'self_tests':validation_self_tests(),
+            'historical_replay':{'status':'NOT VERIFIED',
+             'reason':'Existing replay uses legacy professional_decision; no timestamped historical depth/trade imbalance available for weighted engine.'}}
 
 @app.get('/api/futures-feed-check')
 async def futures_feed_check():
