@@ -206,60 +206,54 @@ function renderLiquidity(asset,stale){
     return '<div class="liquidity-sequence-row"><time>'+shortTime(row.ts)+'</time><span>'+bid+'</span><span>'+taker+'</span><b class="liq-label '+tone+'">'+htmlSafe(label)+'</b></div>';
   }).join(''):'<p class="placeholder">The first observation will appear after a successful exchange poll.</p>';
 }
-// Retire every obsolete browser journal key; old cached rows must never reappear.
-try {
-  for(let i=localStorage.length-1;i>=0;i--){
-    const key=localStorage.key(i);
-    if(key&&key.startsWith('btc-intel-signal-journal-')&&!key.startsWith('btc-intel-signal-journal-v091-'))
-      localStorage.removeItem(key);
-  }
-}catch{/* private browsing */}
-const journalKey = symbol => 'btc-intel-signal-journal-v091-'+symbol;
-const currentJournalVersion = '0.9.3';
+// Only real v0.13+ paper entries; never reintroduce legacy v0.9 browser rows.
+const journalKey = symbol => 'btc-intel-signal-journal-v013-'+symbol;
+const isPaperRow = row => /^0\.13\./.test(String(row?.strategy_version||''));
 const signalId = row => String(row.ts)+'|'+String(row.entry)+'|'+String(row.side);
 function cachedSignalRows(symbol){
-  let cached=[];
-  try{cached=JSON.parse(localStorage.getItem(journalKey(symbol))||'[]');if(!Array.isArray(cached))cached=[]}catch{cached=[]}
-  return cached.filter(row=>['0.9.2','0.9.3'].includes(row.strategy_version)).slice(0,5);
+  try{
+    const rows=JSON.parse(localStorage.getItem(journalKey(symbol))||'[]');
+    return Array.isArray(rows)?rows.filter(isPaperRow).slice(0,5):[];
+  }catch{return []}
 }
 function storeSignalRows(symbol,rows){
-  try{localStorage.setItem(journalKey(symbol),JSON.stringify(rows))}catch{/* privacy mode may block storage */}
+  try{localStorage.setItem(journalKey(symbol),JSON.stringify(rows.slice(0,5)))}catch{/* privacy mode */}
 }
-function signalLogRows(){
-  const fresh=(current?.signal_log?.[selected]||[]).filter(row=>['0.9.2','0.9.3'].includes(row.strategy_version));
-  const cached=cachedSignalRows(selected);
+function mergePaperRows(fresh,cached){
   const ids=new Set();
-  const merged=[...fresh,...cached].filter(row=>{
+  return [...fresh,...cached].filter(row=>{
+    if(!isPaperRow(row))return false;
     const id=signalId(row);
     if(ids.has(id))return false;
     ids.add(id);return true;
   }).sort((a,b)=>Date.parse(b.ts)-Date.parse(a.ts)).slice(0,5);
+}
+function signalLogRows(){
+  const merged=mergePaperRows(current?.signal_log?.[selected]||[],cachedSignalRows(selected));
   storeSignalRows(selected,merged);
   return merged;
 }
 async function reconcileBrowserHistory(){
   await Promise.all(['BTCUSDT','ETHUSDT'].map(async symbol=>{
-    const fresh=(current?.signal_log?.[symbol]||[]).filter(row=>['0.9.2','0.9.3'].includes(row.strategy_version));
+    const fresh=(current?.signal_log?.[symbol]||[]).filter(isPaperRow);
     const cached=cachedSignalRows(symbol);
     const freshIds=new Set(fresh.map(signalId));
     const orphan=cached.filter(row=>!freshIds.has(signalId(row))).slice(0,5);
-    if(!orphan.length)return;
     let checked=[];
-    try{
-      const response=await fetch('/api/reconcile-cached-signals',{
-        method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',signal:AbortSignal.timeout(12000),
-        body:JSON.stringify({symbol,rows:orphan})
-      });
-      if(!response.ok)throw new Error('Verification feed unavailable');
-      checked=(await response.json()).rows||[];
-    }catch{
-      checked=orphan.map(row=>({...row,coverage:'FEED UNAVAILABLE',history_source:'BROWSER RECOVERED',
-        verification_note:'Browser copy has not been verified against current exchange history.'}));
+    if(orphan.length){
+      try{
+        const response=await fetch('/api/reconcile-cached-signals',{
+          method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',
+          signal:AbortSignal.timeout(12000),body:JSON.stringify({symbol,rows:orphan})
+        });
+        if(!response.ok)throw new Error('Verification feed unavailable');
+        checked=(await response.json()).rows||[];
+      }catch{
+        checked=orphan.map(row=>({...row,coverage:'FEED UNAVAILABLE',
+          history_source:'BROWSER RECOVERED',verification_note:'Exchange verification unavailable.'}));
+      }
     }
-    const ids=new Set();
-    const merged=[...fresh,...checked].filter(row=>{
-      const id=signalId(row);if(ids.has(id))return false;ids.add(id);return true;
-    }).sort((a,b)=>Date.parse(b.ts)-Date.parse(a.ts)).slice(0,5);
+    const merged=mergePaperRows(fresh,checked);
     current.signal_log[symbol]=merged;
     storeSignalRows(symbol,merged);
   }));
