@@ -1983,6 +1983,26 @@ async def state():
         return JSONResponse(data,headers={'Cache-Control':'no-store, max-age=0'})
 
  
+@app.get('/api/signal-diagnostics')
+async def signal_diagnostics():
+    """Read-only current decision, execution evidence and last five journal entries."""
+    async with LOCK:
+        return JSONResponse({'version':STRATEGY_VERSION,'updated':STATE.get('updated'),
+            'assets':{symbol:{'direction':asset.get('direction'),
+                'directional_bias':asset.get('market_bias_v13'),
+                'long_score':asset.get('long_score_v13'),
+                'short_score':asset.get('short_score_v13'),
+                'blockers':asset.get('signal_blockers_v13',[]),
+                'spread':asset.get('spread_diagnostics'),
+                'spread_bps':asset.get('spread_bps_v13'),
+                'relative_volume':asset.get('relative_volume_v13'),
+                'risk_pct':asset.get('risk_pct_v13'),
+                'last_five_signals':[row for row in STATE.get('signal_log',{}).get(symbol,[])
+                    if row.get('strategy_version')==STRATEGY_VERSION][:5]}
+                for symbol,asset in STATE.get('assets',{}).items()}},
+            headers={'Cache-Control':'no-store, max-age=0'})
+
+
 @app.post('/api/reconcile-cached-signals')
 async def reconcile_cached_signals(request: Request):
     """Re-check browser-only paper rows after ephemeral server DB replacement.
