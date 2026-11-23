@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.13.1'
+STRATEGY_VERSION = '0.13.2'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1260,13 +1260,18 @@ def independent_v13_decision(k15,k1h,k4h,price,spread,imbalance=None,trade_imbal
     result['market_bias']=best if scores[best]['score']-scores[other]['score']>=8 else 'NEUTRAL'
     candidate=scores[best]
     blocks=[]
-    if spread is None or not math.isfinite(spread) or spread>8 or spread<0:blocks.append('Spread unavailable or >8 bps')
+    if spread is None or not math.isfinite(spread):blocks.append('Spread missing or invalid')
+    elif spread<0:blocks.append('Negative spread')
+    elif spread>8:blocks.append(f'Spread {spread:.2f} bps exceeds 8 bps')
     if candidate['setup']=='NO SETUP':blocks.append('No confirmed 15M setup')
     if not candidate['geometry']:blocks.append('Entry too far or stop geometry invalid')
     if candidate['score']<55:blocks.append('Score below 55')
     if candidate['score']-scores[other]['score']<8:blocks.append('Long/short conflict')
     if rv<0.55:blocks.append('Participation below 0.55x')
     result['blocked_reasons']=blocks
+    result['spread_bps_observed']=round(spread,3) if spread is not None and math.isfinite(spread) else None
+    result['relative_volume_observed']=round(rv,3)
+    result['risk_pct_observed']=round(100*candidate['risk']/price,3)
     result['reason']=f'LONG {scores["LONG"]["score"]}/100; SHORT {scores["SHORT"]["score"]}/100; relative volume {rv:.2f}x. '+('; '.join(blocks) if blocks else 'Qualified paper setup')
     if blocks:return result
     side=1 if best=='LONG' else -1
@@ -1336,7 +1341,10 @@ def attach_strategies(asset,one_minute,k15,k1h,k4h,kd,spread,imbalance=None,trad
                   'market_bias_v13':independent['market_bias'],
                   'long_score_v13':independent['long_score'],
                   'short_score_v13':independent['short_score'],
-                  'signal_blockers_v13':independent['blocked_reasons']})
+                  'signal_blockers_v13':independent['blocked_reasons'],
+                  'spread_bps_v13':independent.get('spread_bps_observed'),
+                  'relative_volume_v13':independent.get('relative_volume_observed'),
+                  'risk_pct_v13':independent.get('risk_pct_observed')})
     scalp=scalper_decision(one_minute,asset['price'],spread,imbalance,trade_imbalance)
     def pack(decision):
         return {key:decision.get(key) for key in ('direction','levels','signal_score','signal_grade',
@@ -1548,9 +1556,12 @@ async def fetch_asset_kraken_futures(client,symbol,macro=None):
     def levels(name):
         return [[str(x['price']),str(x.get('qty',x.get('size',0)))] if isinstance(x,dict)
                 else [str(x[0]),str(x[1])] for x in rawbook.get(name,[])]
-    book={'bids':levels('bids'),'asks':levels('asks')}
+    book={'bids':sorted(levels('bids'),key=lambda x:float(x[0]),reverse=True),
+          'asks':sorted(levels('asks'),key=lambda x:float(x[0]))}
     if not book['bids'] or not book['asks']:
         raise RuntimeError('Kraken Futures order book empty')
+    if float(book['bids'][0][0])>=float(book['asks'][0][0]):
+        raise RuntimeError('Kraken Futures crossed or locked order book')
     fetched_at=datetime.now(timezone.utc).isoformat()
     funding=ticker_row.get('fundingRate')
     oi=ticker_row.get('openInterest')
@@ -1572,7 +1583,11 @@ async def fetch_asset_kraken_futures(client,symbol,macro=None):
     c=asset.get('_observation_candles')
     bid=book['bids'][0][0];ask=book['asks'][0][0]
     spread_bps=(float(ask)-float(bid))/price*10000
-    attach_strategies(asset,c,k15,k1,k4,kd,spread_bps)
+    bid_depth=sum(float(x[1]) for x in book['bids'])
+    ask_depth=sum(float(x[1]) for x in book['asks'])
+    imbalance=(bid_depth-ask_depth)/(bid_depth+ask_depth) if bid_depth+ask_depth else None
+    asset['spread_diagnostics']={'best_bid':float(bid),'best_ask':float(ask),'spread_bps':round(spread_bps,3),'fetched_at':fetched_at,'source':contract,'freshness_verified':False}
+    attach_strategies(asset,c,k15,k1,k4,kd,spread_bps,imbalance,None)
     return asset
 
 
