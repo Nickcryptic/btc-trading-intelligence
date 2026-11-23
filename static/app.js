@@ -83,10 +83,15 @@ function renderDecision(asset,stale){
   const b=asset.bias,t=asset.timing;
   setScore('bias',b,asset.bias_label);
   setScore('timing',t,asset.timing_label);
-  const checks=asset.signal_checks||[];
+  const v13=asset.strategies?.independent_v13;
+  const blockers=asset.signal_blockers_v13||[];
+  const checks=(asset.signal_checks||[]).length?asset.signal_checks:
+    blockers.map(reason=>({label:'Entry blocked',ok:false,detail:reason}));
   const passed=checks.filter(x=>x.ok).length;
   $('signal-gates').innerHTML=checks.map(x=>gate(x.label,x.ok&&!stale,stale?'STALE':x.detail)).join('')||'<p class="placeholder">Awaiting completed-candle evaluation.</p>';
-  $('gate-result').textContent=stale?'FEED STALE':(Number(asset.signal_score)||0)+' / 100 · '+htmlSafe(asset.signal_grade||'UNRATED')+' · '+passed+'/'+checks.length+' checks';
+  $('gate-result').textContent=stale?'FEED STALE':
+    'LONG '+(asset.long_score_v13??'—')+' / SHORT '+(asset.short_score_v13??'—')+
+    ' · Bias '+(asset.market_bias_v13||'NEUTRAL')+' · '+passed+'/'+checks.length+' checks';
   const confirmed=!stale&&['LONG CANDIDATE','SHORT CANDIDATE'].includes(asset.direction)&&asset.levels;
   const watching=!stale&&!confirmed&&['LONG','SHORT'].includes(asset.watch_direction)&&asset.watch_levels;
   const status=$('signal-status');
@@ -101,7 +106,7 @@ function renderDecision(asset,stale){
     status.classList.add('wait');
     $('signal-reason').textContent=asset.setup_reason+' This is a conditional plan, NOT an activated signal.';
   }else{
-    status.textContent=stale?'FEED STALE':'NO QUALIFIED SETUP';
+    status.textContent=stale?'FEED STALE':(['LONG','SHORT'].includes(asset.market_bias_v13)?'BIAS '+asset.market_bias_v13+' · ENTRY WAIT':'NO QUALIFIED SETUP');
     status.classList.add('wait');
     $('signal-reason').textContent=stale?'Last observation is too old. No new paper setup until refreshed.':(asset.setup_reason||'No qualified market evidence yet.');
   }
