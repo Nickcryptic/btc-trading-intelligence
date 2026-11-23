@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.13.3'
+STRATEGY_VERSION = '0.13.4'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -1292,6 +1292,75 @@ def independent_v13_decision(k15,k1h,k4h,price,spread,imbalance=None,trade_imbal
     return result
 
 
+
+def adaptive_paper_entry(candles, higher, price, spread, mode):
+    """Short-history, completed-bar momentum/pullback paper model. Independent per timeframe."""
+    result={'direction':'NO TRADE','levels':None,'signal_score':0,'signal_grade':'NONE',
+            'trigger':'NONE','signal_candle_ts':None,'checks':[],
+            'reason':'Waiting for usable completed candles.'}
+    needed=22 if mode=='SCALP' else 26
+    if not candles or len(candles)<needed+1 or not math.isfinite(price) or price<=0:
+        result['reason']=f'{mode}: need {needed} completed candles.'
+        return result
+    bars=sorted(candles,key=lambda x:x['ts'])[:-1]
+    if len(bars)<needed:return result
+    recent=bars[-needed:]
+    period=60000 if mode=='SCALP' else 900000
+    # Missing bars are visible as a feed-quality failure, not silently interpolated.
+    gaps=sum(recent[i]['ts']-recent[i-1]['ts']!=period for i in range(1,len(recent)))
+    if gaps>2:
+        result['reason']=f'{mode}: {gaps} gaps in recent market candles.'
+        return result
+    a=atr(recent,14)
+    if not a or not math.isfinite(a) or a<=0:return result
+    closes=[x['close'] for x in recent]
+    e8=ema(closes,8);e20=ema(closes,20)
+    last=recent[-1]
+    previous=recent[-5]
+    h=sorted(higher,key=lambda x:x['ts'])[:-1] if higher else []
+    htrend=0
+    if len(h)>=9:
+        htrend=1 if h[-1]['close']>h[-5]['close'] else -1 if h[-1]['close']<h[-5]['close'] else 0
+    volbase=median(x['volume'] for x in recent[-16:-1])
+    rv=last['volume']/volbase if volbase>0 else None
+    candidates=[]
+    for side in (1,-1):
+        trend=(e8-e20)*side>0
+        impulse=(last['close']-previous['close'])*side>=0.75*a
+        candle=(last['close']-last['open'])*side>=0.12*a
+        pivot=max(x['high'] for x in recent[-11:-2]) if side==1 else min(x['low'] for x in recent[-11:-2])
+        break_confirm=(last['close']-pivot)*side>0.05*a
+        pullback=(min(x['low'] for x in recent[-5:])<=e8 if side==1 else max(x['high'] for x in recent[-5:])>=e8) and (last['close']-e8)*side>0
+        setup='BREAKOUT' if break_confirm and candle else 'PULLBACK CONTINUATION' if pullback and candle else 'MOMENTUM' if impulse and candle else None
+        if not setup or not trend:continue
+        if mode=='SWING' and htrend==-side and not (break_confirm and impulse):continue
+        stop_distance=max((1.35 if mode=='SCALP' else 1.8)*a,price*(0.00035 if mode=='SCALP' else 0.001))
+        stop=price-side*stop_distance
+        risk_pct=100*stop_distance/price
+        if risk_pct>(0.65 if mode=='SCALP' else 2.5):continue
+        if abs(price-last['close'])>(2.0 if mode=='SCALP' else 1.5)*a:continue
+        if spread is None or not math.isfinite(spread) or spread<0 or spread>(8 if mode=='SCALP' else 10):continue
+        score=50+(12 if break_confirm else 0)+(10 if impulse else 0)+(8 if htrend==side else 0)+(8 if rv is not None and rv>=0.8 else 0)+(7 if candle else 0)
+        if score<62:continue
+        candidates.append((score,side,stop,stop_distance,setup))
+    if not candidates:
+        result['reason']=f'{mode}: no qualified 8/20 EMA trend with completed-bar breakout, pullback or momentum; spread, price proximity and ATR risk still checked.'
+        return result
+    score,side,stop,risk,setup=max(candidates,key=lambda x:x[0])
+    result.update({'direction':'LONG CANDIDATE' if side==1 else 'SHORT CANDIDATE',
+        'levels':{'entry':round(price,2),'stop':round(stop,2),
+                  'tp1':round(price+side*risk,2),'tp2':round(price+side*1.75*risk,2),
+                  'tp3':round(price+side*2.5*risk,2),
+                  'risk_pct':round(100*risk/price,3),'status':'PAPER RESEARCH — NOT FILLED'},
+        'signal_score':score,'signal_grade':'HIGH' if score>=80 else 'MODERATE',
+        'trigger':mode+' '+setup,'signal_candle_ts':last['ts'],
+        'reason':f'{mode} {setup}: completed candles, EMA 8/20 trend, ATR-based risk; {score}/100 heuristic evidence, not win probability.',
+        'checks':[{'label':'Trend','ok':True,'detail':'EMA 8/20 aligned'},
+                  {'label':'Setup','ok':True,'detail':setup},
+                  {'label':'Execution','ok':True,'detail':f'{spread:.2f} bps spread'}]})
+    return result
+
+
 def attach_strategies(asset,one_minute,k15,k1h,k4h,kd,spread,imbalance=None,trade_imbalance=None):
     # Existing 15M/1H/4H strategy retained and independently reported as Swing.
     swing=professional_decision(k15,k1h,k4h,kd,asset['price'],spread,None,imbalance,trade_imbalance)
@@ -1331,6 +1400,7 @@ def attach_strategies(asset,one_minute,k15,k1h,k4h,kd,spread,imbalance=None,trad
                                             {'label':'1H momentum','ok':True,'detail':'ALIGNED'},
                                             {'label':'Entry risk','ok':True,'detail':f'{levels["risk_pct"]:.2f}%'}]})
                     break
+    swing=adaptive_paper_entry(k15,k1h,asset['price'],spread,'SWING')
     weighted=weighted_v12_decision(k15,k1h,asset['price'],spread,imbalance,trade_imbalance)
     independent=independent_v13_decision(k15,k1h,k4h,asset['price'],spread,imbalance,trade_imbalance)
     # V13 owns the primary paper journal. Legacy strategies remain visible as comparisons.
@@ -1347,7 +1417,7 @@ def attach_strategies(asset,one_minute,k15,k1h,k4h,kd,spread,imbalance=None,trad
                   'spread_bps_v13':independent.get('spread_bps_observed'),
                   'relative_volume_v13':independent.get('relative_volume_observed'),
                   'risk_pct_v13':independent.get('risk_pct_observed')})
-    scalp=scalper_decision(one_minute,asset['price'],spread,imbalance,trade_imbalance)
+    scalp=adaptive_paper_entry(one_minute,k15,asset['price'],spread,'SCALP')
     def pack(decision):
         return {key:decision.get(key) for key in ('direction','levels','signal_score','signal_grade',
                 'trigger','reason','signal_candle_ts','checks','watch_direction','watch_levels','trigger_price')}
