@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.13.4'
+STRATEGY_VERSION = '0.13.5'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -73,7 +73,10 @@ def init_db():
         if 'strategy_version' not in columns:
             db.execute("ALTER TABLE signals ADD COLUMN strategy_version TEXT DEFAULT 'LEGACY'")
         if 'candle_ts' not in columns:
-            db.execute('ALTER TABLE signals ADD COLUMN candle_ts INTEGER')
+            db.execute('ALTER TABLE signals ADD COLUMN candle_ts '+('BIGINT' if db.pg else 'INTEGER'))
+        if db.pg:
+            # Unix epoch milliseconds exceed PostgreSQL INT4 range.
+            db.execute('ALTER TABLE signals ALTER COLUMN candle_ts TYPE BIGINT USING candle_ts::BIGINT')
         if 'model_score' not in columns:
             db.execute('ALTER TABLE signals ADD COLUMN model_score INTEGER')
         if 'setup_type' not in columns:
@@ -1693,7 +1696,13 @@ async def refresh():
                 STATE['observation_candles'][symbol]=candles
                 STATE['assets'][symbol]=result
                 STATE['source_errors'].pop(symbol,None)
-                STATE['signal_log'][symbol]=record_signal_log(symbol,result,previous,candles)
+                try:
+                    STATE['signal_log'][symbol]=record_signal_log(symbol,result,previous,candles)
+                except Exception:
+                    LOG.exception('PAPER_JOURNAL_WRITE_FAILED symbol=%s direction=%s',symbol,result.get('direction'))
+                    STATE['source_errors'][symbol]='Paper journal write failed; signal not persisted'
+                    # Do not prevent other assets or refresh data from updating.
+                    STATE['signal_log'][symbol]=STATE['signal_log'].get(symbol,[])
                 STATE['previous_direction'][symbol]=result['direction']
                 liquidity_history=STATE['liquidity_history'].setdefault(symbol,[])
                 observation=liquidity_observation(result,liquidity_history[0] if liquidity_history else None)
