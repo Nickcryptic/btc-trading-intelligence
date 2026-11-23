@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.13.2'
+STRATEGY_VERSION = '0.13.3'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -500,7 +500,7 @@ def record_signal_log(symbol, asset, previous_direction, candles=None):
     now=datetime.now(timezone.utc)
     with open_db() as db:
         db.row_factory=sqlite3.Row
-        existing=list(db.execute("SELECT * FROM signals WHERE symbol=? AND strategy_version=? ORDER BY id DESC LIMIT 5",(symbol,STRATEGY_VERSION)))
+        existing=list(db.execute("SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5",(symbol,)))
         for row in existing:
             observed=reconcile_signal(row,candles,asset.get('observation_source','Exchange spot · 1M OHLC'))
             db.execute('''UPDATE signals SET status=?,checked_until_ms=?,observed_at=?,
@@ -516,7 +516,7 @@ def record_signal_log(symbol, asset, previous_direction, candles=None):
             candle_ts=asset.get('signal_candle_ts')
             # One signal per completed 15M trigger candle, never repeated by 2M polling.
             # Each subsequent qualifying candle can create a new journal entry.
-            seen=bool(candle_ts is not None and any(row['candle_ts']==candle_ts for row in existing))
+            seen=bool(candle_ts is not None and any(row['candle_ts']==candle_ts and row['side']==side and row['strategy_version']==STRATEGY_VERSION for row in existing))
             # No time-based cooldown: new qualifying candle may trigger immediately.
             if not seen:
                 db.execute('INSERT INTO signals(ts,symbol,side,entry,stop,tp1,tp2,tp3,bias,timing,status,strategy_version,candle_ts,model_score,setup_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -525,7 +525,9 @@ def record_signal_log(symbol, asset, previous_direction, candles=None):
                             'PENDING ENTRY',STRATEGY_VERSION,candle_ts,asset.get('signal_score'),asset.get('setup_trigger')))
         # FIFO: newest five remain, oldest removed only when a sixth is inserted.
         db.execute('DELETE FROM signals WHERE symbol=? AND id NOT IN (SELECT id FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5)',(symbol,symbol))
-        return [dict(row) for row in db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5',(symbol,))]
+        rows=[dict(row) for row in db.execute('SELECT * FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 5',(symbol,))]
+        LOG.info('PAPER_JOURNAL symbol=%s direction=%s entries=%s newest=%s',symbol,direction,len(rows),rows[0]['ts'] if rows else 'none')
+        return rows
 
 
 def score_label(score):
@@ -1978,7 +1980,7 @@ async def state():
             for row in rows:
                 row.pop('book_snapshot',None)
         # Never expose migrated legacy rows, including any stale in-memory snapshot.
-        data['signal_log']={symbol:[row for row in rows if row.get('strategy_version') in ('0.9.2', STRATEGY_VERSION)][:5]
+        data['signal_log']={symbol:[row for row in rows if str(row.get('strategy_version','')).startswith('0.13.')][:5]
                             for symbol,rows in data['signal_log'].items()}
         return JSONResponse(data,headers={'Cache-Control':'no-store, max-age=0'})
 
@@ -1998,7 +2000,7 @@ async def signal_diagnostics():
                 'relative_volume':asset.get('relative_volume_v13'),
                 'risk_pct':asset.get('risk_pct_v13'),
                 'last_five_signals':[row for row in STATE.get('signal_log',{}).get(symbol,[])
-                    if row.get('strategy_version')==STRATEGY_VERSION][:5]}
+                    if str(row.get('strategy_version','')).startswith('0.13.')][:5]}
                 for symbol,asset in STATE.get('assets',{}).items()}},
             headers={'Cache-Control':'no-store, max-age=0'})
 
