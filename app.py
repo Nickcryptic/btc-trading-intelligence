@@ -27,7 +27,7 @@ DB_PATH = Path(os.getenv('DB_PATH', str(ROOT / 'signals.db')))
 SYMBOLS = ('BTCUSDT', 'ETHUSDT')
 LOG = logging.getLogger('market')
 logging.basicConfig(level=logging.INFO)
-STRATEGY_VERSION = '0.13.5'
+STRATEGY_VERSION = '0.13.6'
 STATE = {'updated': None, 'assets': {}, 'macro': {}, 'source_errors': {}, 'wintermute': [], 'decision_log': {}, 'signal_log': {}, 'previous_direction': {}, 'liquidity_monitor': {}, 'liquidity_history': {}, 'observation_candles': {}, 'version': STRATEGY_VERSION, 'etf': {'status':'pending','assets':{},'updated':None}}
 LOCK = asyncio.Lock()
 MACRO_CACHE = {'expires': 0, 'value': {}}
@@ -81,10 +81,12 @@ def init_db():
             db.execute('ALTER TABLE signals ADD COLUMN model_score INTEGER')
         if 'setup_type' not in columns:
             db.execute('ALTER TABLE signals ADD COLUMN setup_type TEXT')
-        for column,kind in (('checked_until_ms','INTEGER'),('observed_at','TEXT'),
+        for column,kind in (('checked_until_ms','BIGINT' if db.pg else 'INTEGER'),('observed_at','TEXT'),
                             ('observation_source','TEXT'),('coverage','TEXT'),('verification_note','TEXT')):
             if column not in columns:
                 db.execute(f'ALTER TABLE signals ADD COLUMN {column} {kind}')
+        if db.pg:
+            db.execute('ALTER TABLE signals ALTER COLUMN checked_until_ms TYPE BIGINT USING checked_until_ms::BIGINT')
         # Only current-model paper signals belong in the five-entry FIFO journal.
         # Retire pre-v0.8.2 rows, including LEGACY rows, without re-importing them.
         # Preserve prior versions across releases; the UI filters to the current version.
